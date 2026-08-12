@@ -73,6 +73,8 @@ class VtkPreview(tk.Frame):
         prop.SetAmbient(0.32)
         prop.SetDiffuse(0.78)
         self.renderer.AddActor(self.actor)
+        self._ref_actors: list[vtk.vtkActor] = []
+        self._ref_bounds: list[tuple[np.ndarray, np.ndarray]] = []
 
     def _save_key(self) -> str:
         if self.on_key_save:
@@ -99,14 +101,79 @@ class VtkPreview(tk.Frame):
             self.mapper.SetInputData(normals.GetOutput())
 
             if reset_camera:
-                mins = vertices.min(axis=0)
-                maxs = vertices.max(axis=0)
+                mins, maxs = self._combined_bounds(vertices)
                 self.center = 0.5 * (mins + maxs)
                 self._extent = float(max(np.linalg.norm(maxs - mins), 1.0))
                 self.distance = self._extent * 1.55
                 self.elev = 22.0
                 self.azim = -40.0
         self.redraw(immediate=True)
+
+    def set_reference_meshes(
+        self,
+        meshes: Iterable[tuple[np.ndarray, np.ndarray]],
+        *,
+        reset_camera: bool = False,
+    ) -> None:
+        """Show imported STEP solids as a translucent overlay (constraint context)."""
+        with VTK_LOCK:
+            for actor in self._ref_actors:
+                self.renderer.RemoveActor(actor)
+            self._ref_actors = []
+            self._ref_bounds = []
+            for vertices, faces in meshes:
+                verts = np.asarray(vertices, dtype=np.float64)
+                faces_arr = np.asarray(faces, dtype=np.int64)
+                if len(verts) == 0 or len(faces_arr) == 0:
+                    continue
+                points = vtk.vtkPoints()
+                points.SetData(numpy_to_vtk(verts, deep=True))
+                cells = np.empty((len(faces_arr), 4), dtype=np.int64)
+                cells[:, 0] = 3
+                cells[:, 1:] = faces_arr
+                cell_array = vtk.vtkCellArray()
+                cell_array.ImportLegacyFormat(numpy_to_vtkIdTypeArray(cells.ravel(), deep=True))
+                poly = vtk.vtkPolyData()
+                poly.SetPoints(points)
+                poly.SetPolys(cell_array)
+                mapper = vtk.vtkPolyDataMapper()
+                mapper.SetInputData(poly)
+                actor = vtk.vtkActor()
+                actor.SetMapper(mapper)
+                prop = actor.GetProperty()
+                prop.SetColor(0.28, 0.45, 0.62)
+                prop.SetOpacity(0.28)
+                prop.SetAmbient(0.35)
+                prop.SetDiffuse(0.7)
+                prop.EdgeVisibilityOn()
+                prop.SetEdgeColor(0.18, 0.32, 0.48)
+                prop.SetLineWidth(1.0)
+                self.renderer.AddActor(actor)
+                self._ref_actors.append(actor)
+                self._ref_bounds.append((verts.min(axis=0), verts.max(axis=0)))
+            if reset_camera and self.mapper.GetInput() is not None:
+                try:
+                    pdata = self.mapper.GetInput()
+                    bounds = pdata.GetBounds()
+                    design = np.array(
+                        [[bounds[0], bounds[2], bounds[4]], [bounds[1], bounds[3], bounds[5]]],
+                        dtype=np.float64,
+                    )
+                    mins, maxs = self._combined_bounds(design)
+                    self.center = 0.5 * (mins + maxs)
+                    self._extent = float(max(np.linalg.norm(maxs - mins), 1.0))
+                    self.distance = self._extent * 1.55
+                except Exception:
+                    pass
+        self.redraw(immediate=True)
+
+    def _combined_bounds(self, vertices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        mins = np.asarray(vertices, dtype=np.float64).min(axis=0)
+        maxs = np.asarray(vertices, dtype=np.float64).max(axis=0)
+        for bmin, bmax in self._ref_bounds:
+            mins = np.minimum(mins, bmin)
+            maxs = np.maximum(maxs, bmax)
+        return mins, maxs
 
     def _apply_camera(self) -> None:
         elev_r, azim_r = np.deg2rad(self.elev), np.deg2rad(self.azim)

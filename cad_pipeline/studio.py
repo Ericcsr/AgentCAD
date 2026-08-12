@@ -21,7 +21,7 @@ from cad_pipeline.runtime import (
     export_stl,
     save_design_script,
 )
-from cad_pipeline.ui_dialogs import ask_save_name
+from cad_pipeline.ui_dialogs import ask_open_step_paths, ask_save_name
 from cad_pipeline.ui_scale import (
     apply_scaling,
     colors,
@@ -111,6 +111,13 @@ class DesignStudio:
             )
         )
         self._log_system(mesh_bbox_summary(initial.vertices))
+        self._refresh_reference_overlay(reset_camera=bool(self.agent.references))
+        if self.agent.references:
+            names = ", ".join(f"`{r.name}`" for r in self.agent.references)
+            self._log_system(
+                f"STEP references in context: {names}\n"
+                + "\n\n".join(r.summary for r in self.agent.references)
+            )
         if self.agent.features:
             self._log_system(self.agent.features_summary())
         self._log_system(
@@ -249,6 +256,10 @@ class DesignStudio:
         ttk.Button(view_row, text="ZIP all STLs", command=self._on_export_all_stl_zip).pack(
             side=tk.LEFT, padx=(scaled(self.root, 6), 0)
         )
+        self.import_step_btn = ttk.Button(
+            view_row, text="Import STEP", command=self._on_import_step
+        )
+        self.import_step_btn.pack(side=tk.LEFT, padx=(scaled(self.root, 10), 0))
 
         preview_border = tk.Frame(left, bg=c["border"], bd=0, highlightthickness=0)
         preview_border.grid(row=2, column=0, sticky="nsew")
@@ -519,15 +530,23 @@ class DesignStudio:
     def _set_mesh(self, vertices, faces, *, reset_camera: bool) -> None:
         self.preview.set_mesh(vertices, faces, reset_camera=reset_camera)
 
+    def _refresh_reference_overlay(self, *, reset_camera: bool = False) -> None:
+        meshes = [(ref.vertices, ref.faces) for ref in self.agent.references]
+        self.preview.set_reference_meshes(meshes, reset_camera=reset_camera)
+
     def _geometry_context(self) -> str:
         verts, faces = self.result.mesh_for(self.view_scope)
         base = geometry_summary(verts, triangles=len(faces))
         names = ", ".join(self.result.part_names()) or "(none)"
-        return (
+        block = (
             f"Viewing: {self._scope_label(self.view_scope)}\n"
             f"Parts: {names}\n"
             f"{base}"
         )
+        refs = self.agent.references_block()
+        if refs:
+            block += "\n\n" + refs
+        return block
 
     def _capture_current_view(self) -> Path | None:
         try:
@@ -590,6 +609,7 @@ class DesignStudio:
             getattr(self, "refine_btn", None),
             getattr(self, "rollback_btn", None),
             getattr(self, "version_combo", None),
+            getattr(self, "import_step_btn", None),
         ):
             if btn is not None:
                 try:
@@ -863,6 +883,48 @@ class DesignStudio:
                 if self.agent.features:
                     self._log_system(self.agent.features_summary())
                 self._refresh_version_ui(select_id=version_id)
+
+            self.root.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_import_step(self) -> None:
+        if self._busy or self._closed:
+            return
+        paths = ask_open_step_paths(self.root, initialdir=self.models_dir)
+        if not paths:
+            return
+        self._set_busy(True, "Agent · Reading STEP…")
+        self._log_system("Importing STEP: " + ", ".join(p.name for p in paths))
+
+        def work() -> None:
+            imported: list = []
+            err: str | None = None
+            try:
+                for path in paths:
+                    imported.append(self.agent.add_step_reference(path))
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+
+            def done() -> None:
+                if self._closed:
+                    return
+                self._set_busy(False, "Agent · Ready")
+                if err:
+                    self._log_error(f"STEP import failed · {err}")
+                    messagebox.showerror("Import STEP failed", err, parent=self.root)
+                    return
+                self._refresh_reference_overlay(reset_camera=True)
+                for ref in imported:
+                    self._log_system(
+                        f"Loaded STEP `{ref.name}` into agent context "
+                        f"({ref.n_solids} solid(s), {mesh_bbox_summary(ref.vertices)})\n"
+                        f"{ref.summary}"
+                    )
+                self._log_system(
+                    "Next Agent / Ask message will include these measured constraints. "
+                    "Ghost overlay = imported STEP (not the live design)."
+                )
 
             self.root.after(0, done)
 

@@ -25,6 +25,11 @@ from cad_pipeline.mesh_utils import geometry_summary
 from cad_pipeline.models import DEFAULT_MODEL, resolve_model
 from cad_pipeline.render import RENDER_DIR, MeshRenderer, list_views
 from cad_pipeline.runtime import DesignResult, run_design_code
+from cad_pipeline.step_import import (
+    StepReference,
+    format_references_block,
+    import_step_file,
+)
 from cad_pipeline.versioning import DesignVersionStore, VersionMeta, VersionSnapshot
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -339,8 +344,9 @@ Hard requirements:
   build() alone if you prefer — runtime accepts either)
 - Units are millimeters. Z is up. Object sits on the XY floor (z=0).
 - Prefer robust boolean unions of simple boxes/cylinders/extrusions.
-- Import nothing in that file; `cq` (cadquery) and `math` are injected at runtime.
-- Do not print, network, or use __import__ inside build()/parts().
+- Do not use `__import__` / `import` in that file. Injected at runtime: `cq` (cadquery),
+  `math`, and `import_reference(name)` for user-attached STEP files.
+- Do not print or network inside build()/parts().
 - Do NOT modify any other project files.
 - Do NOT run CadQuery yourself; just write the source file.
 - After writing the file, reply with a one-line confirmation.
@@ -357,6 +363,14 @@ Parts:
 - When a revision is scoped to ONE part, change only that part's geometry; keep other
   parts' names and interfaces stable unless the user asks otherwise.
 
+Imported STEP references:
+- The user may attach existing STEP models as constraints (mating, envelope, holes).
+- Measured facts are in the prompt and in generated/references/<name>.md.
+- Staged files live at generated/references/<name>.step.
+- To use the exact B-rep in CadQuery, call import_reference("name") (returns Workplane).
+- Prefer copying measured dimensions into parametric code; import the STEP only when
+  you need the exact shape (cut/union/mate/envelope).
+
 Vision / camera:
 - RGB preview images of the current design may be attached (labeled by view name).
 - Use them to judge proportions, gaps, and mistakes before editing.
@@ -371,7 +385,7 @@ The previous build() failed. Fix the Python so build() succeeds.
 
 Hard requirements:
 - Overwrite generated/current_design.py with a FULL corrected build()/parts() implementation.
-- Import nothing; `cq` and `math` are injected at runtime.
+- Do not use `__import__`; `cq`, `math`, and `import_reference(name)` are injected.
 - Keep the user's design intent; only fix the error (and closely related issues).
 - Prefer simple CadQuery patterns: box/cylinder/extrude + union/cut + Workplane.rotate/translate.
 - Keep a parts() dict of named components when the design has multiple pieces.
@@ -383,7 +397,8 @@ ASK_BRIEF = """You are in ASK mode for a CAD design review — read-only.
 
 Hard requirements:
 - Answer the user's question about the current design clearly and concisely.
-- Use the attached RGB renders, CadQuery source, and measured geometry as ground truth.
+- Use the attached RGB renders, CadQuery source, measured geometry, and any imported
+  STEP reference facts as ground truth.
 - Units are millimeters unless the user asks otherwise.
 - Do NOT modify any files. Do NOT write code. Do NOT edit the workspace.
 - Do NOT suggest you changed the model; Ask mode never changes geometry.
@@ -458,7 +473,7 @@ REFINE_BRIEF = """You are refining a CadQuery design after a failed design revie
 
 Hard requirements:
 - Overwrite generated/current_design.py with a FULL updated build() implementation.
-- Import nothing; `cq` and `math` are injected at runtime.
+- Do not use `__import__`; `cq`, `math`, and `import_reference(name)` are injected.
 - Address EVERY listed ACTION / ISSUE from the review while keeping the user's brief.
 - Satisfy every UNMET key feature listed in the checklist.
 - Prefer robust CadQuery patterns (box/cylinder/extrude + union/cut + Workplane.rotate/translate).
@@ -471,7 +486,8 @@ or hit a context/API failure.
 
 Hard requirements:
 1) FIRST read generated/context_worksheet.md end-to-end.
-2) Also read generated/current_design.py and generated/feature_list.json if they exist.
+2) Also read generated/current_design.py, generated/feature_list.json, and
+   generated/references/*.md if they exist.
 3) Treat the worksheet Task Summary / Requirements / Key Features as ground truth.
 4) Continue the Active Task — do not restart the whole product from scratch unless the
    design file is missing or empty.
@@ -665,6 +681,7 @@ class DesignAgent:
     # draft = build/render only; refine = full constraint review
     design_mode: str | None = None
     worksheet: ContextWorksheet = field(default_factory=ContextWorksheet)
+    references: list[StepReference] = field(default_factory=list)
     _cursor_agent: object | None = field(default=None, init=False, repr=False)
     _renderer: MeshRenderer = field(default_factory=MeshRenderer, init=False, repr=False)
     _vertices: np.ndarray | None = field(default=None, init=False, repr=False)
@@ -729,6 +746,32 @@ class DesignAgent:
             )
         return self.model
 
+    def references_block(self) -> str:
+        return format_references_block(self.references)
+
+    def _prompt_references(self) -> str:
+        block = self.references_block()
+        return f"{block}\n" if block else ""
+
+    def add_step_reference(self, path: Path) -> StepReference:
+        """Import a STEP file, extract facts, and attach it as design context."""
+        existing = {ref.name for ref in self.references}
+        # Reuse the same name if this exact source was already loaded
+        for ref in self.references:
+            if ref.source_path.resolve() == Path(path).expanduser().resolve():
+                existing.discard(ref.name)
+                break
+        new_ref = import_step_file(Path(path), existing_names=existing)
+        self.references = [r for r in self.references if r.name != new_ref.name]
+        self.references.append(new_ref)
+        try:
+            self.update_worksheet(
+                notes=f"Imported STEP reference `{new_ref.name}` from {new_ref.source_path.name}."
+            )
+        except Exception:
+            pass
+        return new_ref
+
     # --- context worksheet --------------------------------------------------
 
     def update_worksheet(
@@ -747,6 +790,7 @@ class DesignAgent:
         ws.model = self.model
         ws.requirements = self.last_requirements or ws.requirements
         ws.features_text = format_feature_status(self.features) if self.features else ws.features_text
+        ws.references_text = self.references_block()
         if phase is not None:
             ws.phase = phase
         if task_instruction is not None:
@@ -1427,10 +1471,18 @@ class DesignAgent:
     def generate(self, prompt: str) -> str:
         """Create an initial design from a natural-language brief."""
         self.history = [{"role": "user", "content": prompt}]
-        self.last_requirements = prompt.strip()
-        self.worksheet = ContextWorksheet(model=self.model, requirements=prompt.strip())
+        req = prompt.strip()
+        if self.references:
+            names = ", ".join(f"`{r.name}`" for r in self.references)
+            req = f"{req}\n\nImported STEP constraints: {names}"
+        self.last_requirements = req
+        self.worksheet = ContextWorksheet(
+            model=self.model,
+            requirements=req,
+            references_text=self.references_block(),
+        )
         self.update_worksheet(phase="generate", task_instruction=prompt.strip())
-        self.sync_features(prompt, replace=True)
+        self.sync_features(req, replace=True)
         feature_block = format_feature_list(self.features)
         self.update_worksheet(phase="generate", task_instruction=prompt.strip())
         if self.backend == "mock":
@@ -1440,6 +1492,7 @@ class DesignAgent:
         else:
             code = self._run_cursor(
                 f"{SYSTEM_BRIEF}\n\n"
+                f"{self._prompt_references()}"
                 f"Key features to satisfy:\n{feature_block}\n\n"
                 f"Create a NEW CadQuery design for this brief:\n{prompt}\n\n"
                 f"Write it to {DESIGN_FILE.relative_to(ROOT)} now."
@@ -1520,6 +1573,7 @@ class DesignAgent:
                 f"{SYSTEM_BRIEF}\n\n"
                 f"Revise the existing design in {DESIGN_FILE.relative_to(ROOT)}.\n"
                 f"{scope_block}\n"
+                f"{self._prompt_references()}"
                 f"Key features that must remain satisfied (updated):\n{feature_block}\n\n"
                 f"Current source for reference:\n```python\n{self.current_code}\n```\n\n"
                 f"Study the attached RGB renders. If you need another angle, call "
@@ -1607,6 +1661,7 @@ class DesignAgent:
         )
         prompt = (
             f"{DEBUG_BRIEF}\n\n"
+            f"{self._prompt_references()}"
             f"Broken source:\n```python\n{broken_code}\n```\n\n"
             f"Error traceback:\n```\n{err}\n```\n\n"
             f"Overwrite {DESIGN_FILE.relative_to(ROOT)} with the corrected full build() source."
@@ -1794,6 +1849,7 @@ class DesignAgent:
 
         prompt = (
             f"{REVIEW_BRIEF}\n\n"
+            f"{self._prompt_references()}"
             f"User requirements / brief:\n{requirements or '(none provided)'}\n\n"
             f"Key feature checklist (evaluate EVERY item):\n{feature_block}\n\n"
             f"Measured geometry:\n{geo}\n"
@@ -1849,6 +1905,7 @@ class DesignAgent:
 
         prompt = (
             f"{REFINE_BRIEF}\n\n"
+            f"{self._prompt_references()}"
             f"User requirements / brief:\n{requirements or '(none)'}\n\n"
             f"Feature checklist status:\n{feature_block}\n\n"
             f"UNMET features to implement:\n{unmet_block}\n\n"
@@ -1920,6 +1977,7 @@ class DesignAgent:
     ) -> str:
         prompt = (
             f"{ASK_BRIEF}\n\n"
+            f"{self._prompt_references()}"
             f"Current CadQuery source (read-only):\n```python\n{self.current_code}\n```\n\n"
         )
         if self.features:

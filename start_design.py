@@ -3,7 +3,7 @@
 AI CAD Design — interactive language → STEP pipeline.
 
 Flow:
-  1. Popup asks for a language design brief
+  1. Popup asks for a language design brief (optional: load existing STEP constraints)
   2. Cursor agent writes CadQuery code and builds the solid
   3. Interactive VTK studio opens for review + language revisions
   4. Ctrl+S saves the STEP (and matching .py) under models/
@@ -96,10 +96,12 @@ def run_pipeline(*, fast: bool | None = None, model: str | None = None) -> int:
     models_dir = ROOT / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
 
-    prompt = ask_initial_prompt()
-    if not prompt:
+    brief = ask_initial_prompt()
+    if not brief:
         print("Cancelled.")
         return 0
+    prompt = brief.prompt
+    step_paths = list(brief.step_paths)
 
     agent = DesignAgent()
     if fast is not None:
@@ -111,6 +113,8 @@ def run_pipeline(*, fast: bool | None = None, model: str | None = None) -> int:
         f"fast={'on' if agent.fast else 'off'}  "
         f"mode={agent.mode_label()}"
     )
+    if step_paths:
+        print("STEP references:", ", ".join(p.name for p in step_paths))
 
     progress, set_message, close_progress = _show_progress("Generating initial design…")
     # VTK OpenGL must run on the Tk thread — marshal agent renders here until Studio takes over
@@ -119,6 +123,10 @@ def run_pipeline(*, fast: bool | None = None, model: str | None = None) -> int:
 
     def work() -> None:
         try:
+            if step_paths:
+                progress.after(0, lambda: set_message("Reading STEP reference(s)…"))
+                for path in step_paths:
+                    agent.add_step_reference(path)
             progress.after(0, lambda: set_message("Asking design agent…"))
             code = agent.generate(prompt)
             result = agent.finalize_design(

@@ -113,6 +113,7 @@ class ContextWorksheet:
     model: str = ""
     updated_at: str = field(default_factory=_now)
     notes: str = ""
+    references_text: str = ""
 
     def render(self) -> str:
         sections = [
@@ -140,6 +141,9 @@ class ContextWorksheet:
             "",
             "## Key Features",
             self.features_text.strip() or "(none)",
+            "",
+            "## Imported STEP References",
+            self.references_text.strip() or "(none)",
             "",
             "## Geometry",
             self.geometry.strip() or "(none)",
@@ -191,6 +195,7 @@ class ContextWorksheet:
         ws.task_summary = _section(text, "Task Summary").strip()
         ws.requirements = _section(text, "Requirements").strip()
         ws.features_text = _section(text, "Key Features").strip()
+        ws.references_text = _section(text, "Imported STEP References").strip()
         ws.geometry = _section(text, "Geometry").strip()
         ws.last_review = _section(text, "Last Review").strip()
         ws.conversation_digest = _section(text, "Conversation Digest").strip()
@@ -217,6 +222,8 @@ class ContextWorksheet:
             f"Requirements: {truncate(self.requirements, 700)}.",
             f"Features: {truncate(self.features_text, 700)}.",
         ]
+        if self.references_text:
+            parts.append(f"STEP references: {truncate(self.references_text, 500)}.")
         if self.last_review:
             parts.append(f"Last review: {truncate(self.last_review, 400)}.")
         parts.append(

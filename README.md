@@ -13,6 +13,7 @@ Describe a product in plain English. AgentCAD writes parametric CadQuery, builds
 | **Agent design** | Cursor SDK writes `generated/current_design.py` (Grok / Claude / OpenAI / Composer) |
 | **Studio** | Orbit/zoom 3D preview + Agent / Ask chat |
 | **Parts** | Named parts — view, export, or edit one at a time |
+| **STEP import** | Load existing STEP as agent constraints (bbox, holes, topology) |
 | **Drafting vs refinement** | Fast “builds & renders” loop, or full feature/physics review |
 | **Version history** | Snapshot each change; rollback design + chat (**Ctrl+Z**) |
 | **Self-repair** | CadQuery errors fed back to the agent until build succeeds |
@@ -98,6 +99,20 @@ Designs should expose named parts via `parts()` (assembly in `build()`).
 - **Export part STEP** / **Export all STEP** — separate STEP files  
 - **Export part STL** — single-part triangle mesh  
 - **ZIP all STLs** — folder of part meshes + a `.zip` under `models/`  
+- **Import STEP** — add an existing STEP as agent context (ghost overlay in the preview)
+
+### Imported STEP references
+
+Load a STEP **before the first prompt** (Load STEP… on the start dialog) or later with **Import STEP** in the studio.
+
+The agent does not only display the file. It:
+
+- Copies it to `generated/references/<name>.step`
+- Extracts bbox, volume, solid count, face types, and cylinder radii (holes/shafts)
+- Writes `generated/references/<name>.md` and injects those facts into generate / revise / Ask / review
+- Can use the exact B-rep in CadQuery via `import_reference("name")` (injected at runtime)
+
+The live design stays parametric CadQuery. The imported STEP is a constraint (mate, envelope, matching holes). A translucent overlay in the 3D view shows the reference next to the current design.
 
 - **Edit scope** (Agent tab) — apply a revision to the whole design or one part  
 

@@ -13,6 +13,7 @@ import math
 import numpy as np
 
 from cad_pipeline.mesh_utils import solid_to_mesh
+from cad_pipeline.step_import import load_reference_solid
 
 WHOLE_DESIGN = "__whole__"
 
@@ -142,6 +143,7 @@ def run_design_code(code: str) -> DesignResult:
         "cq": cq,
         "cadquery": cq,
         "math": math,
+        "import_reference": load_reference_solid,
     }
 
     try:
