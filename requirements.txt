@@ -1,0 +1,5 @@
+cadquery>=2.4
+numpy>=1.26
+vtk>=9.3
+cursor-sdk>=1.0
+python-dotenv>=1.0

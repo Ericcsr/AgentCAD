@@ -1,0 +1,187 @@
+# AgentCAD
+
+**Language → CadQuery → STEP**, driven by a Cursor agent (Grok) with an interactive 3D studio.
+
+Describe a product in plain English. AgentCAD writes parametric CadQuery, builds the solid, shows it in VTK, and lets you revise by chat — with parts, version history, drafting/refinement modes, and crash recovery.
+
+---
+
+## Features
+
+| Area | What you get |
+|------|----------------|
+| **Agent design** | Cursor SDK + Grok writes `generated/current_design.py` |
+| **Studio** | Orbit/zoom 3D preview + Agent / Ask chat |
+| **Parts** | Named parts — view, export, or edit one at a time |
+| **Drafting vs refinement** | Fast “builds & renders” loop, or full feature/physics review |
+| **Version history** | Snapshot each change; rollback design + chat (**Ctrl+Z**) |
+| **Self-repair** | CadQuery errors fed back to the agent until build succeeds |
+| **Crash recovery** | Context worksheet + new agent resume after API / context failures |
+
+---
+
+## Requirements
+
+- Python **3.10+** (3.11–3.13 recommended)
+- Linux / macOS / Windows with a working display (Tk + VTK)
+- A [Cursor API key](https://cursor.com/dashboard/integrations) for live designs  
+  (optional: offline **mock** backend for UI demos)
+
+---
+
+## Setup
+
+```bash
+git clone <your-repo-url> AgentCAD
+cd AgentCAD
+
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+
+pip install -r requirements.txt
+```
+
+Configure environment:
+
+```bash
+cp .env.example .env
+# Edit .env and set:
+#   CURSOR_API_KEY=cursor_...
+```
+
+Or export for the session:
+
+```bash
+export CURSOR_API_KEY=cursor_...
+```
+
+---
+
+## Quick start
+
+```bash
+python start_design.py
+```
+
+1. Enter a design brief (e.g. *“a wooden dining chair with a slight recline”*).
+2. Wait while the agent generates CadQuery and builds the mesh.
+3. The **Studio** opens — orbit the model, revise in **Agent**, ask questions in **Ask**.
+4. **Ctrl+S** saves STEP + matching `.py` under `models/`.
+
+### Useful flags
+
+```bash
+python start_design.py --fast      # Cursor model fast mode
+python start_design.py --no-fast   # force fast off even if DESIGN_FAST=1
+
+DESIGN_LLM=mock python start_design.py   # offline demo, no API key
+```
+
+---
+
+## Studio guide
+
+### Modes (header)
+
+- **Drafting** (default) — stop once the design compiles and renders. Fast iteration.
+- **Refinement** — after each build, check key features + physics; refine until pass or budget ends.
+
+### Parts
+
+Designs should expose named parts via `parts()` (assembly in `build()`).
+
+- **View** — isolate a part in the 3D preview  
+- **Export part** / **Export all parts** — separate STEP files  
+- **Edit scope** (Agent tab) — apply a revision to the whole design or one part  
+
+### Agent vs Ask
+
+- **Agent** — language edits that rewrite CadQuery and rebuild  
+- **Ask** — read-only Q&A about dimensions / structure (uses RGB views)
+
+### Version history
+
+Every successful design (open + each Agent apply) is snapshotted under `generated/versions/`.
+
+- Pick a version in **History** → **Rollback**  
+- Or **Ctrl+Z** for the previous version  
+
+Rollback restores CAD, features, and chat transcript, and clears the Cursor agent conversation.
+
+### Shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| **Ctrl+Enter** | Send Agent / Ask message |
+| **Ctrl+S** | Save full assembly STEP + script |
+| **Ctrl+Z** | Roll back to previous version |
+
+---
+
+## Configuration
+
+Copy from `.env.example`. Common variables:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `CURSOR_API_KEY` | — | Cursor Integrations API key |
+| `DESIGN_MODEL` | `grok-4.5` | Model id for Cursor SDK |
+| `DESIGN_LLM` | `auto` | `auto` \| `cursor` \| `mock` |
+| `DESIGN_MODE` | `draft` | `draft` \| `refine` |
+| `DESIGN_FAST` | off | `1` / `true` → model `fast=true` |
+| `DESIGN_DEBUG_RETRIES` | `5` | Build → debug cycles |
+| `DESIGN_REVIEW_ROUNDS` | `3` | Review → refine rounds (refine mode) |
+| `DESIGN_AGENT_RECOVERIES` | `3` | Worksheet relaunches per failed send |
+| `DESIGN_UI_SCALE` | auto | Override HiDPI UI scale (e.g. `2.0`) |
+
+---
+
+## Project layout
+
+```text
+AgentCAD/
+├── start_design.py          # Entry: prompt → agent → studio
+├── requirements.txt
+├── .env.example
+├── cad_pipeline/
+│   ├── agent.py             # Cursor/mock agent, review, recovery
+│   ├── runtime.py           # Execute CadQuery, parts, STEP export
+│   ├── studio.py            # Tk + VTK interactive UI
+│   ├── versioning.py        # Design / chat snapshots
+│   ├── context_worksheet.py # Crash-recovery memory
+│   └── ...
+├── generated/               # Working design, renders, versions (gitignored)
+└── models/                  # Saved STEP + .py exports
+```
+
+Generated CadQuery is expected to look like:
+
+```python
+def parts():
+    return {
+        "seat": ...,
+        "leg_fl": ...,
+        "backrest": ...,
+    }
+
+def build():
+    solid = None
+    for p in parts().values():
+        solid = p if solid is None else solid.union(p)
+    return solid
+```
+
+---
+
+## Tips
+
+- Prefer **Drafting** while exploring form; switch to **Refinement** before locking a design.
+- Use **Edit scope** for local changes (e.g. only `backrest`) so other parts stay stable.
+- If the Cursor agent stalls or hits context limits, check `generated/context_worksheet.md` — recovery relaunches from that file automatically.
+- On 4K/5K displays, set `DESIGN_UI_SCALE=2.0` (or similar) if chrome feels too small/large.
+
+---
+
+## License
+
+Add your preferred license here.
