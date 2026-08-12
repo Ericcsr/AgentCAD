@@ -1,6 +1,6 @@
 # AgentCAD
 
-**Language → CadQuery → STEP**, driven by a Cursor agent (Grok) with an interactive 3D studio.
+**Language → CadQuery → STEP**, driven by a Cursor agent with an interactive 3D studio.
 
 Describe a product in plain English. AgentCAD writes parametric CadQuery, builds the solid, shows it in VTK, and lets you revise by chat — with parts, version history, drafting/refinement modes, and crash recovery.
 
@@ -10,7 +10,7 @@ Describe a product in plain English. AgentCAD writes parametric CadQuery, builds
 
 | Area | What you get |
 |------|----------------|
-| **Agent design** | Cursor SDK + Grok writes `generated/current_design.py` |
+| **Agent design** | Cursor SDK writes `generated/current_design.py` (Grok / Claude / OpenAI / Composer) |
 | **Studio** | Orbit/zoom 3D preview + Agent / Ask chat |
 | **Parts** | Named parts — view, export, or edit one at a time |
 | **Drafting vs refinement** | Fast “builds & renders” loop, or full feature/physics review |
@@ -73,6 +73,10 @@ python start_design.py
 ```bash
 python start_design.py --fast      # Cursor model fast mode
 python start_design.py --no-fast   # force fast off even if DESIGN_FAST=1
+python start_design.py --model grok-4.6
+python start_design.py --model claude
+python start_design.py --model openai
+python start_design.py --list-models
 
 DESIGN_LLM=mock python start_design.py   # offline demo, no API key
 ```
@@ -128,7 +132,7 @@ Copy from `.env.example`. Common variables:
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `CURSOR_API_KEY` | — | Cursor Integrations API key |
-| `DESIGN_MODEL` | `grok-4.5` | Model id for Cursor SDK |
+| `DESIGN_MODEL` | `grok-4.5` | Cursor SDK model id or alias (`grok-4.6`, `claude`, `openai`, …). CLI `--model` overrides |
 | `DESIGN_LLM` | `auto` | `auto` \| `cursor` \| `mock` |
 | `DESIGN_MODE` | `draft` | `draft` \| `refine` |
 | `DESIGN_FAST` | off | `1` / `true` → model `fast=true` |
@@ -136,6 +140,19 @@ Copy from `.env.example`. Common variables:
 | `DESIGN_REVIEW_ROUNDS` | `3` | Review → refine rounds (refine mode) |
 | `DESIGN_AGENT_RECOVERIES` | `3` | Worksheet relaunches per failed send |
 | `DESIGN_UI_SCALE` | auto | Override HiDPI UI scale (e.g. `2.0`) |
+
+`--model` / `DESIGN_MODEL` accept an alias or a raw Cursor SDK id. `--model` wins over the env var.
+
+| Flag / alias | Resolves to |
+|--------------|-------------|
+| `grok-4.5` (default) | `grok-4.5` |
+| `grok-4.6` | `grok-4.6` |
+| `claude` | `claude-sonnet-5` |
+| `claude-opus` | `claude-opus-5` |
+| `openai` | `gpt-5.4` |
+| `composer` | `composer-2.5` |
+
+Run `python start_design.py --list-models` for the full alias list. Any other string is passed through as the Cursor model id.
 
 ---
 

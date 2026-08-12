@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Design agent: language → CadQuery via Cursor SDK (Grok 4.5) or mock."""
+"""Design agent: language → CadQuery via Cursor SDK or mock."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from cad_pipeline.context_worksheet import (
     truncate,
 )
 from cad_pipeline.mesh_utils import geometry_summary
+from cad_pipeline.models import DEFAULT_MODEL, resolve_model
 from cad_pipeline.render import RENDER_DIR, MeshRenderer, list_views
 from cad_pipeline.runtime import DesignResult, run_design_code
 from cad_pipeline.versioning import DesignVersionStore, VersionMeta, VersionSnapshot
@@ -650,9 +651,9 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 @dataclass
 class DesignAgent:
-    """Conversational CAD agent powered by Cursor SDK + Grok 4.5."""
+    """Conversational CAD agent powered by Cursor SDK."""
 
-    model: str = field(default_factory=lambda: os.getenv("DESIGN_MODEL", "grok-4.5"))
+    model: str = field(default_factory=lambda: os.getenv("DESIGN_MODEL", DEFAULT_MODEL))
     api_key: str | None = field(default_factory=lambda: os.getenv("CURSOR_API_KEY"))
     history: list[dict[str, str]] = field(default_factory=list)
     current_code: str | None = None
@@ -676,7 +677,7 @@ class DesignAgent:
     def __post_init__(self) -> None:
         load_dotenv(ROOT / ".env")
         self.api_key = os.getenv("CURSOR_API_KEY") or self.api_key
-        self.model = os.getenv("DESIGN_MODEL", self.model)
+        self.model = resolve_model(os.getenv("DESIGN_MODEL", self.model))
         self.backend = os.getenv("DESIGN_LLM", self.backend)
         if self.fast is None:
             self.fast = _env_flag("DESIGN_FAST", False)
@@ -1125,7 +1126,7 @@ class DesignAgent:
             return
         if not self.api_key:
             raise RuntimeError(
-                "CURSOR_API_KEY is required for Cursor Grok designs.\n"
+                "CURSOR_API_KEY is required for Cursor SDK designs.\n"
                 "Create one at https://cursor.com/dashboard/integrations\n"
                 "Then: export CURSOR_API_KEY=...   or put it in .env\n"
                 "Or run offline: DESIGN_LLM=mock python start_design.py"

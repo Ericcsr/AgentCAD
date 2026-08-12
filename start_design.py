@@ -4,21 +4,24 @@ AI CAD Design — interactive language → STEP pipeline.
 
 Flow:
   1. Popup asks for a language design brief
-  2. Cursor agent (Grok 4.5) writes CadQuery code and builds the solid
+  2. Cursor agent writes CadQuery code and builds the solid
   3. Interactive VTK studio opens for review + language revisions
   4. Ctrl+S saves the STEP (and matching .py) under models/
 
 Usage:
   export CURSOR_API_KEY=...   # https://cursor.com/dashboard/integrations
   python start_design.py
+  python start_design.py --model grok-4.6
+  python start_design.py --model claude
+  python start_design.py --model openai
   python start_design.py --fast          # Cursor model fast mode
   DESIGN_FAST=1 python start_design.py   # same via env
 
   DESIGN_LLM=mock python start_design.py   # offline demo (no API key)
 
 Optional env (.env supported):
-  CURSOR_API_KEY         required for Cursor Grok designs
-  DESIGN_MODEL           default grok-4.5
+  CURSOR_API_KEY         required for Cursor designs
+  DESIGN_MODEL           default grok-4.5 (aliases: grok-4.6, claude, openai, …)
   DESIGN_LLM             auto|cursor|mock  (auto → cursor if key present)
   DESIGN_FAST            1/true to enable Cursor model fast mode
   DESIGN_MODE            draft|refine (default draft — skip constraint review)
@@ -41,6 +44,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from cad_pipeline.agent import DesignAgent
+from cad_pipeline.models import DEFAULT_MODEL, model_help_text, resolve_model
 from cad_pipeline.studio import DesignStudio
 from cad_pipeline.ui_dialogs import ask_initial_prompt
 from cad_pipeline.ui_scale import apply_scaling, colors, fit_window, fonts, scaled
@@ -88,7 +92,7 @@ def _show_progress(message: str = "Designing…") -> tuple[tk.Tk, Callable[[str]
     return root, set_message, close
 
 
-def run_pipeline(*, fast: bool | None = None) -> int:
+def run_pipeline(*, fast: bool | None = None, model: str | None = None) -> int:
     models_dir = ROOT / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
 
@@ -100,6 +104,8 @@ def run_pipeline(*, fast: bool | None = None) -> int:
     agent = DesignAgent()
     if fast is not None:
         agent.fast = fast
+    if model is not None:
+        agent.model = resolve_model(model)
     print(
         f"LLM backend: {agent.backend}  model={agent.model}  "
         f"fast={'on' if agent.fast else 'off'}  "
@@ -159,7 +165,26 @@ def run_pipeline(*, fast: bool | None = None) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="AI CAD Design — language → STEP")
+    parser = argparse.ArgumentParser(
+        description="AI CAD Design — language → STEP",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=model_help_text(),
+    )
+    parser.add_argument(
+        "-m",
+        "--model",
+        metavar="ID",
+        help=(
+            "Cursor SDK model or alias "
+            f"(default: {DEFAULT_MODEL} / DESIGN_MODEL). "
+            "Examples: grok-4.5, grok-4.6, claude, claude-opus, openai, composer"
+        ),
+    )
+    parser.add_argument(
+        "--list-models",
+        action="store_true",
+        help="Print model aliases and exit",
+    )
     parser.add_argument(
         "--fast",
         action="store_true",
@@ -171,12 +196,15 @@ def main() -> None:
         help="Disable Cursor model fast mode even if DESIGN_FAST is set",
     )
     args = parser.parse_args()
+    if args.list_models:
+        print(model_help_text())
+        raise SystemExit(0)
     fast: bool | None = None
     if args.fast:
         fast = True
     elif args.no_fast:
         fast = False
-    raise SystemExit(run_pipeline(fast=fast))
+    raise SystemExit(run_pipeline(fast=fast, model=args.model))
 
 
 if __name__ == "__main__":
