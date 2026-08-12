@@ -91,7 +91,10 @@ DESIGN_LLM=mock python start_design.py   # offline demo, no API key
 Designs should expose named parts via `parts()` (assembly in `build()`).
 
 - **View** — isolate a part in the 3D preview  
-- **Export part** / **Export all parts** — separate STEP files  
+- **Export part STEP** / **Export all STEP** — separate STEP files  
+- **Export part STL** — single-part triangle mesh  
+- **ZIP all STLs** — folder of part meshes + a `.zip` under `models/`  
+
 - **Edit scope** (Agent tab) — apply a revision to the whole design or one part  
 
 ### Agent vs Ask

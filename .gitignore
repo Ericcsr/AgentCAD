@@ -45,6 +45,8 @@ models/*.png
 models/*.jpg
 models/*.jpeg
 models/*.stl
+models/*.zip
+models/*_stl/
 models/*.obj
 models/*.gltf
 models/*.glb

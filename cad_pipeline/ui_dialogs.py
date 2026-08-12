@@ -104,19 +104,29 @@ def ask_initial_prompt(parent: tk.Tk | None = None) -> str | None:
     return result["prompt"]
 
 
-def ask_save_name(parent: tk.Misc, models_dir: Path) -> Path | None:
-    """Ask for a STEP filename and return the full path, or None if cancelled."""
+def ask_save_name(
+    parent: tk.Misc,
+    models_dir: Path,
+    *,
+    title: str = "Save STEP",
+    prompt: str = "Enter a name for the STEP file (without path):",
+    initialvalue: str = "design.step",
+    extensions: tuple[str, ...] = (".step", ".stp"),
+    default_ext: str = ".step",
+) -> Path | None:
+    """Ask for an export filename and return the full path, or None if cancelled."""
     models_dir.mkdir(parents=True, exist_ok=True)
     name = simpledialog.askstring(
-        "Save STEP",
-        "Enter a name for the STEP file (without path):",
+        title,
+        prompt,
         parent=parent,
-        initialvalue="design.step",
+        initialvalue=initialvalue,
     )
     if not name:
         return None
     name = name.strip()
-    if not name.lower().endswith((".step", ".stp")):
-        name += ".step"
+    lower = name.lower()
+    if not any(lower.endswith(ext) for ext in extensions):
+        name += default_ext
     name = Path(name).name
     return models_dir / name

@@ -12,7 +12,15 @@ from typing import Callable
 from cad_pipeline.agent import DesignAgent
 from cad_pipeline.mesh_utils import geometry_summary, mesh_bbox_summary
 from cad_pipeline.render import RENDER_DIR
-from cad_pipeline.runtime import WHOLE_DESIGN, DesignResult, export_parts, export_step, save_design_script
+from cad_pipeline.runtime import (
+    WHOLE_DESIGN,
+    DesignResult,
+    export_parts,
+    export_parts_stl_zip,
+    export_step,
+    export_stl,
+    save_design_script,
+)
 from cad_pipeline.ui_dialogs import ask_save_name
 from cad_pipeline.ui_scale import (
     apply_scaling,
@@ -229,10 +237,16 @@ class DesignStudio:
         )
         self.view_scope_combo.pack(side=tk.LEFT)
         self.view_scope_combo.bind("<<ComboboxSelected>>", self._on_view_scope_changed)
-        ttk.Button(view_row, text="Export part", command=self._on_export_part).pack(
+        ttk.Button(view_row, text="Export part STEP", command=self._on_export_part).pack(
             side=tk.LEFT, padx=(scaled(self.root, 8), 0)
         )
-        ttk.Button(view_row, text="Export all parts", command=self._on_export_all_parts).pack(
+        ttk.Button(view_row, text="Export part STL", command=self._on_export_part_stl).pack(
+            side=tk.LEFT, padx=(scaled(self.root, 6), 0)
+        )
+        ttk.Button(view_row, text="Export all STEP", command=self._on_export_all_parts).pack(
+            side=tk.LEFT, padx=(scaled(self.root, 6), 0)
+        )
+        ttk.Button(view_row, text="ZIP all STLs", command=self._on_export_all_stl_zip).pack(
             side=tk.LEFT, padx=(scaled(self.root, 6), 0)
         )
 
@@ -860,18 +874,23 @@ class DesignStudio:
         scope = self.view_scope
         if scope == WHOLE_DESIGN:
             messagebox.showinfo(
-                "Export part",
+                "Export part STEP",
                 "Select a specific part in View first (not Whole design).",
                 parent=self.root,
             )
             return
         suggested = f"{scope}.step"
-        path = ask_save_name(self.root, self.models_dir)
+        path = ask_save_name(
+            self.root,
+            self.models_dir,
+            title="Export part STEP",
+            prompt="Enter a name for the STEP file (without path):",
+            initialvalue=suggested,
+            extensions=(".step", ".stp"),
+            default_ext=".step",
+        )
         if path is None:
             return
-        # Prefer part name in filename when user kept default
-        if path.name in {"design.step", "design.stp"}:
-            path = path.with_name(suggested)
         try:
             export_step(self.result.solid_for(scope), path)
             self._log_system(f"Exported part `{scope}` → {path.name}")
@@ -879,17 +898,80 @@ class DesignStudio:
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Export failed", str(exc), parent=self.root)
 
+    def _on_export_part_stl(self) -> None:
+        if self._busy or self._closed:
+            return
+        scope = self.view_scope
+        if scope == WHOLE_DESIGN:
+            messagebox.showinfo(
+                "Export part STL",
+                "Select a specific part in View first (not Whole design).",
+                parent=self.root,
+            )
+            return
+        suggested = f"{scope}.stl"
+        path = ask_save_name(
+            self.root,
+            self.models_dir,
+            title="Export part STL",
+            prompt="Enter a name for the STL mesh (without path):",
+            initialvalue=suggested,
+            extensions=(".stl",),
+            default_ext=".stl",
+        )
+        if path is None:
+            return
+        try:
+            export_stl(self.result.solid_for(scope), path)
+            self._log_system(f"Exported part STL `{scope}` → {path.name}")
+            messagebox.showinfo("Exported", f"Wrote part mesh `{scope}`:\n{path}", parent=self.root)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Export failed", str(exc), parent=self.root)
+
     def _on_export_all_parts(self) -> None:
         if self._busy or self._closed:
             return
         if not self.result.part_names():
-            messagebox.showinfo("Export all parts", "No named parts in this design.", parent=self.root)
+            messagebox.showinfo("Export all STEP", "No named parts in this design.", parent=self.root)
             return
         try:
             paths = export_parts(self.result, self.models_dir, basename="design")
             listing = "\n".join(p.name for p in paths)
             self._log_system(f"Exported {len(paths)} part STEP file(s)")
             messagebox.showinfo("Exported parts", f"Wrote:\n{listing}", parent=self.root)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Export failed", str(exc), parent=self.root)
+
+    def _on_export_all_stl_zip(self) -> None:
+        if self._busy or self._closed:
+            return
+        if not self.result.part_names():
+            messagebox.showinfo("ZIP all STLs", "No named parts in this design.", parent=self.root)
+            return
+        path = ask_save_name(
+            self.root,
+            self.models_dir,
+            title="ZIP all STLs",
+            prompt="Enter a name for the ZIP archive (without path):",
+            initialvalue="design_parts_stl.zip",
+            extensions=(".zip",),
+            default_ext=".zip",
+        )
+        if path is None:
+            return
+        try:
+            folder, zip_path = export_parts_stl_zip(
+                self.result,
+                path,
+                basename="design",
+            )
+            listing = "\n".join(p.name for p in sorted(folder.glob("*.stl")))
+            self._log_system(f"Exported STL folder + zip → {folder.name}/ and {zip_path.name}")
+            messagebox.showinfo(
+                "Exported STLs",
+                f"Wrote folder:\n{folder}\n\nZip:\n{zip_path}\n\nMeshes:\n{listing}",
+                parent=self.root,
+            )
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Export failed", str(exc), parent=self.root)
 

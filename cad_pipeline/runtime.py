@@ -211,12 +211,38 @@ def run_design_code(code: str) -> DesignResult:
     )
 
 
+def _safe_part_filename(name: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in name).strip("_") or "part"
+
+
 def export_step(solid: Any, path: Path) -> Path:
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.suffix.lower() not in {".step", ".stp"}:
         path = path.with_suffix(".step")
     cq.exporters.export(solid, str(path))
+    return path
+
+
+def export_stl(
+    solid: Any,
+    path: Path,
+    *,
+    tolerance: float = 0.1,
+    angular_tolerance: float = 0.1,
+) -> Path:
+    """Export a solid as an STL triangle mesh."""
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.suffix.lower() != ".stl":
+        path = path.with_suffix(".stl")
+    cq.exporters.export(
+        solid,
+        str(path),
+        exportType="STL",
+        tolerance=tolerance,
+        angularTolerance=angular_tolerance,
+    )
     return path
 
 
@@ -231,11 +257,77 @@ def export_parts(
     directory.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     for name, part in result.parts.items():
-        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in name).strip("_") or "part"
+        safe = _safe_part_filename(name)
         path = directory / f"{basename}_{safe}.step"
         export_step(part.solid, path)
         written.append(path)
     return written
+
+
+def export_parts_stl(
+    result: DesignResult,
+    directory: Path,
+    *,
+    basename: str = "design",
+    tolerance: float = 0.1,
+    angular_tolerance: float = 0.1,
+) -> list[Path]:
+    """Export each named part as its own STL mesh. Returns written paths."""
+    directory = directory.resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    for name, part in result.parts.items():
+        safe = _safe_part_filename(name)
+        path = directory / f"{basename}_{safe}.stl"
+        export_stl(
+            part.solid,
+            path,
+            tolerance=tolerance,
+            angular_tolerance=angular_tolerance,
+        )
+        written.append(path)
+    return written
+
+
+def export_parts_stl_zip(
+    result: DesignResult,
+    zip_path: Path,
+    *,
+    basename: str = "design",
+    folder_name: str | None = None,
+    tolerance: float = 0.1,
+    angular_tolerance: float = 0.1,
+) -> tuple[Path, Path]:
+    """
+    Write all part STLs into a folder and package them as a zip.
+
+    Returns (folder_path, zip_path).
+    """
+    import zipfile
+
+    zip_path = zip_path.resolve()
+    if zip_path.suffix.lower() != ".zip":
+        zip_path = zip_path.with_suffix(".zip")
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+
+    folder = zip_path.parent / (folder_name or f"{zip_path.stem}_stl")
+    if folder.exists():
+        # Replace previous export of the same name
+        for old in folder.glob("*.stl"):
+            old.unlink()
+    folder.mkdir(parents=True, exist_ok=True)
+
+    stl_paths = export_parts_stl(
+        result,
+        folder,
+        basename=basename,
+        tolerance=tolerance,
+        angular_tolerance=angular_tolerance,
+    )
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for path in stl_paths:
+            zf.write(path, arcname=f"{folder.name}/{path.name}")
+    return folder, zip_path
 
 
 def save_design_script(code: str, path: Path) -> Path:
