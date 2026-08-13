@@ -6,6 +6,8 @@ from __future__ import annotations
 import base64
 import os
 import re
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
@@ -366,7 +368,8 @@ Parts:
 Imported STEP references:
 - The user may attach existing STEP models as constraints (mating, envelope, holes).
 - Measured facts are in the prompt and in generated/references/<name>.md.
-- Staged files live at generated/references/<name>.step.
+- Do NOT open, read, cat, or glob any .step/.stp files — they are large binaries
+  and will stall this session. Facts are already extracted.
 - To use the exact B-rep in CadQuery, call import_reference("name") (returns Workplane).
 - Prefer copying measured dimensions into parametric code; import the STEP only when
   you need the exact shape (cut/union/mate/envelope).
@@ -397,13 +400,14 @@ ASK_BRIEF = """You are in ASK mode for a CAD design review — read-only.
 
 Hard requirements:
 - Answer the user's question about the current design clearly and concisely.
-- Use the attached RGB renders, CadQuery source, measured geometry, and any imported
-  STEP reference facts as ground truth.
+- Use the CadQuery source, measured geometry, and imported STEP *facts* (text) as
+  ground truth. RGB renders are optional; do not wait on extra views.
 - Units are millimeters unless the user asks otherwise.
 - Do NOT modify any files. Do NOT write code. Do NOT edit the workspace.
+- Do NOT open or read any .step/.stp files.
 - Do NOT suggest you changed the model; Ask mode never changes geometry.
 - If a dimension is not explicit in the source, say so and give the best estimate from context.
-- You may call `render_cad_view` to inspect another camera angle before answering.
+- Do not call tools unless the question is specifically about another camera angle.
 """
 
 REVIEW_BRIEF = """You are a senior CAD design reviewer. READ-ONLY — do not edit files.
@@ -487,7 +491,7 @@ or hit a context/API failure.
 Hard requirements:
 1) FIRST read generated/context_worksheet.md end-to-end.
 2) Also read generated/current_design.py, generated/feature_list.json, and
-   generated/references/*.md if they exist.
+   generated/references/*.md if they exist. Never read .step/.stp files.
 3) Treat the worksheet Task Summary / Requirements / Key Features as ground truth.
 4) Continue the Active Task — do not restart the whole product from scratch unless the
    design file is missing or empty.
@@ -658,6 +662,232 @@ def _extract_code(text: str) -> str:
     return text
 
 
+# Prefix for status-bar-only updates (studio will not append these to the chat log).
+_HEARTBEAT_PREFIX = "~ "
+
+
+def _tool_arg_hint(name: str, args: object) -> str:
+    """Short path/command/view snippet for a Cursor tool call."""
+    data = args
+    if not isinstance(data, dict):
+        return ""
+    path = data.get("path") or data.get("file") or data.get("target_file") or data.get("file_path")
+    if path:
+        return f" · {path}"
+    cmd = data.get("command") or data.get("cmd")
+    if cmd:
+        text = str(cmd).replace("\n", " ").strip()
+        if len(text) > 90:
+            text = text[:87] + "…"
+        return f" · {text}"
+    view = data.get("view")
+    if view:
+        return f" · view={view}"
+    query = data.get("pattern") or data.get("query") or data.get("glob")
+    if query:
+        text = str(query).replace("\n", " ").strip()
+        if len(text) > 70:
+            text = text[:67] + "…"
+        return f" · {text}"
+    return ""
+
+
+def _assistant_text_from_message(message: object) -> str:
+    content = getattr(getattr(message, "message", None), "content", ()) or ()
+    chunks: list[str] = []
+    for block in content:
+        text = getattr(block, "text", None)
+        if text:
+            chunks.append(str(text))
+        elif isinstance(block, dict) and block.get("text"):
+            chunks.append(str(block["text"]))
+    return "".join(chunks)
+
+
+def _update_type(update: object) -> str:
+    kind = getattr(update, "type", None)
+    if kind:
+        return str(kind)
+    if isinstance(update, dict):
+        return str(update.get("type") or "")
+    return ""
+
+
+def _tool_from_update(update: object) -> tuple[str, object]:
+    tc = getattr(update, "tool_call", None)
+    if tc is None and isinstance(update, dict):
+        tc = update.get("toolCall") or update.get("tool_call")
+    if not isinstance(tc, dict):
+        return "tool", None
+    nested = tc.get("tool")
+    name = (
+        tc.get("name")
+        or tc.get("toolName")
+        or tc.get("tool_name")
+        or (nested.get("name") if isinstance(nested, dict) else None)
+        or "tool"
+    )
+    args = tc.get("args") or tc.get("arguments") or tc.get("input") or tc.get("params")
+    return str(name), args
+
+
+def _consume_cursor_run(run: object, status: Callable[[str], None]) -> tuple[str, object]:
+    """
+    Wait for the Cursor run while logging thinking/tool deltas.
+
+    Uses run.events() (not messages()) so interaction_update deltas are visible.
+    Same terminal result as run.text() + run.wait().
+    """
+    started = time.monotonic()
+    last_hb = [0.0]
+    texts: list[str] = []
+    saw_thinking = False
+    saw_assistant = False
+    tool_counts: dict[str, int] = {}
+
+    def elapsed() -> float:
+        return time.monotonic() - started
+
+    def heartbeat(msg: str) -> None:
+        now = time.monotonic()
+        if now - last_hb[0] < 0.45:
+            return
+        last_hb[0] = now
+        status(f"{_HEARTBEAT_PREFIX}{msg}  ({elapsed():.0f}s)")
+
+    def on_delta(update: object) -> None:
+        nonlocal saw_thinking, saw_assistant
+        kind = _update_type(update)
+        if kind == "thinking-delta":
+            snippet = (getattr(update, "text", None) or "").strip().replace("\n", " ")
+            if not saw_thinking:
+                saw_thinking = True
+                status(f"Cursor thinking…  ({elapsed():.0f}s)")
+            if snippet:
+                if len(snippet) > 100:
+                    snippet = snippet[:97] + "…"
+                heartbeat(f"Cursor thinking · {snippet}")
+            else:
+                heartbeat("Cursor thinking…")
+        elif kind == "thinking-completed":
+            ms = getattr(update, "thinking_duration_ms", None)
+            extra = f" ({ms}ms)" if ms else ""
+            status(f"Cursor thinking done{extra}  ({elapsed():.0f}s)")
+        elif kind == "tool-call-started":
+            name, args = _tool_from_update(update)
+            tool_counts[name] = tool_counts.get(name, 0) + 1
+            hint = _tool_arg_hint(name, args)
+            status(f"Cursor tool `{name}` started{hint}  ({elapsed():.0f}s)")
+        elif kind == "tool-call-completed":
+            name, args = _tool_from_update(update)
+            hint = _tool_arg_hint(name, args)
+            status(f"Cursor tool `{name}` completed{hint}  ({elapsed():.0f}s)")
+        elif kind == "partial-tool-call":
+            name, args = _tool_from_update(update)
+            heartbeat(f"Cursor tool `{name}` streaming{_tool_arg_hint(name, args)}")
+        elif kind == "text-delta":
+            chunk = getattr(update, "text", None) or ""
+            if chunk:
+                texts.append(str(chunk))
+                if not saw_assistant:
+                    saw_assistant = True
+                    status(f"Cursor assistant reply started  ({elapsed():.0f}s)")
+                else:
+                    heartbeat(f"Cursor writing reply · {sum(len(t) for t in texts):,} chars")
+        elif kind == "shell-output-delta":
+            heartbeat("Cursor shell output…")
+        elif kind in {"step-started", "step-completed"}:
+            step_id = getattr(update, "step_id", "")
+            status(f"Cursor {kind} step={step_id}  ({elapsed():.0f}s)")
+        elif kind == "turn-ended":
+            status(f"Cursor turn ended  ({elapsed():.0f}s)")
+        elif kind:
+            heartbeat(f"Cursor delta · {kind}")
+
+    # Attach delta listener if the run was created with on_delta already;
+    # events() still surfaces sdk_message + interaction_update.
+    run_id = getattr(run, "id", "") or ""
+    agent_id = getattr(run, "agent_id", "") or ""
+    short_run = (str(run_id)[:14] + "…") if len(str(run_id)) > 14 else str(run_id)
+    status(
+        f"Cursor run started"
+        + (f"  id={short_run}" if short_run else "")
+        + (f"  agent={str(agent_id)[:16]}" if agent_id else "")
+        + " — waiting for thinking/tools (deltas on)…"
+    )
+
+    stop_wait_tick = threading.Event()
+
+    def wait_tick() -> None:
+        while not stop_wait_tick.wait(2.0):
+            heartbeat("Cursor still waiting for first thinking/tool event…")
+
+    waiter = threading.Thread(target=wait_tick, daemon=True, name="cursor-wait-tick")
+    waiter.start()
+
+    events = getattr(run, "events", None)
+    try:
+        if callable(events):
+            for event in events():
+                stop_wait_tick.set()
+                msg = getattr(event, "sdk_message", None)
+                update = getattr(event, "interaction_update", None)
+                if update is not None:
+                    on_delta(update)
+                if msg is None:
+                    continue
+                kind = getattr(msg, "type", "") or ""
+                if kind == "thinking":
+                    snippet = (getattr(msg, "text", "") or "").strip().replace("\n", " ")
+                    if not saw_thinking:
+                        saw_thinking = True
+                        status(f"Cursor thinking…  ({elapsed():.0f}s)")
+                    if snippet:
+                        heartbeat(f"Cursor thinking · {snippet[:100]}")
+                elif kind == "tool_call":
+                    name = str(getattr(msg, "name", "") or "tool")
+                    st = str(getattr(msg, "status", "") or "running")
+                    hint = _tool_arg_hint(name, getattr(msg, "args", None))
+                    if st in {"", "running"}:
+                        tool_counts[name] = tool_counts.get(name, 0) + 1
+                        status(f"Cursor tool `{name}` running{hint}  ({elapsed():.0f}s)")
+                    else:
+                        status(f"Cursor tool `{name}` {st}{hint}  ({elapsed():.0f}s)")
+                elif kind == "assistant":
+                    chunk = _assistant_text_from_message(msg)
+                    if chunk:
+                        texts.append(chunk)
+                        if not saw_assistant:
+                            saw_assistant = True
+                            status(f"Cursor assistant reply started  ({elapsed():.0f}s)")
+                        else:
+                            heartbeat(f"Cursor writing reply · {sum(len(t) for t in texts):,} chars")
+                elif kind == "status":
+                    st = str(getattr(msg, "status", "") or "")
+                    extra = str(getattr(msg, "message", "") or "").strip()
+                    line = " ".join(p for p in (st, extra) if p)
+                    if line:
+                        heartbeat(f"Cursor status: {line}")
+                elif kind == "task":
+                    extra = str(getattr(msg, "text", "") or getattr(msg, "status", "") or "").strip()
+                    if extra:
+                        status(f"Cursor task: {extra[:120]}  ({elapsed():.0f}s)")
+    finally:
+        stop_wait_tick.set()
+
+    wait = getattr(run, "wait", None)
+    result = wait() if callable(wait) else None
+    took = elapsed()
+    run_status = getattr(result, "status", None) or getattr(run, "status", "") or "unknown"
+    tools_txt = ", ".join(f"{k}×{v}" for k, v in tool_counts.items() if v) or "none"
+    status(f"Cursor run finished in {took:.0f}s  status={run_status}  tools={tools_txt}")
+    reply = "".join(texts).strip()
+    if not reply:
+        reply = (getattr(run, "result", None) or getattr(result, "result", None) or "") or ""
+        reply = str(reply).strip()
+    return reply, result
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
@@ -746,11 +976,25 @@ class DesignAgent:
             )
         return self.model
 
-    def references_block(self) -> str:
-        return format_references_block(self.references)
+    def set_status_hook(self, hook: Callable[[str], None] | None) -> None:
+        """UI callback for live process traces (chat log + status bar)."""
+        self._status_hook = hook
 
-    def _prompt_references(self) -> str:
-        block = self.references_block()
+    def _trace(self, msg: str) -> None:
+        hook = self._status_hook
+        if hook:
+            hook(msg)
+
+    def _heartbeat(self, msg: str) -> None:
+        hook = self._status_hook
+        if hook:
+            hook(_HEARTBEAT_PREFIX + msg)
+
+    def references_block(self, *, compact: bool = False) -> str:
+        return format_references_block(self.references, compact=compact)
+
+    def _prompt_references(self, *, compact: bool = False) -> str:
+        block = self.references_block(compact=compact)
         return f"{block}\n" if block else ""
 
     def add_step_reference(self, path: Path) -> StepReference:
@@ -764,6 +1008,10 @@ class DesignAgent:
         new_ref = import_step_file(Path(path), existing_names=existing)
         self.references = [r for r in self.references if r.name != new_ref.name]
         self.references.append(new_ref)
+        # Drop the live Cursor agent so the next turn reloads .cursorignore
+        # and does not keep a previously indexed STEP binary in context.
+        if self._cursor_agent is not None:
+            self._close_cursor_agent()
         try:
             self.update_worksheet(
                 notes=f"Imported STEP reference `{new_ref.name}` from {new_ref.source_path.name}."
@@ -1115,6 +1363,8 @@ class DesignAgent:
         return self._call_on_ui(_do)
 
     def _render_tool(self, args: dict, _context) -> dict:
+        view = args.get("view") or "custom"
+        self._trace(f"Tool render_cad_view · {view} (waiting on UI-thread VTK)…")
         if self._vertices is None or self._faces is None:
             return {
                 "content": [{"type": "text", "text": "No mesh loaded yet; cannot render."}],
@@ -1139,12 +1389,14 @@ class DesignAgent:
 
             result = self._call_on_ui(_do)
         except Exception as exc:  # noqa: BLE001
+            self._trace(f"Tool render_cad_view failed: {exc}")
             return {
                 "content": [{"type": "text", "text": f"Render failed: {exc}"}],
                 "isError": True,
             }
 
         rel = result.path.relative_to(ROOT) if result.path.is_relative_to(ROOT) else result.path
+        self._trace(f"Tool render_cad_view done · {rel.name}")
         data_b64 = base64.b64encode(result.path.read_bytes()).decode("ascii")
         return {
             "content": [
@@ -1175,12 +1427,18 @@ class DesignAgent:
                 "Then: export CURSOR_API_KEY=...   or put it in .env\n"
                 "Or run offline: DESIGN_LLM=mock python start_design.py"
             )
-        from cursor_sdk import Agent, CustomTool, LocalAgentOptions
+        from cursor_sdk import Agent, AgentOptions, CustomTool, LocalAgentOptions
 
         GENERATED_DIR.mkdir(parents=True, exist_ok=True)
         RENDER_DIR.mkdir(parents=True, exist_ok=True)
+        self._trace(f"Cursor · creating local agent  model={self.model}  fast={'on' if self.fast else 'off'}")
 
         self._cursor_agent = Agent.create(
+            AgentOptions(
+                # No shell: follow-ups used to `cat` imported STEP binaries and hang.
+                tools=["edit", "read"],
+                disallowed_tools=["shell"],
+            ),
             model=self._model_selection(),
             api_key=self.api_key,
             local=LocalAgentOptions(
@@ -1336,14 +1594,21 @@ class DesignAgent:
             else:
                 message = text
 
-            send_opts = None
-            if use_force:
-                send_opts = SendOptions(local=LocalSendOptions(force=True))
+            send_opts = SendOptions(
+                local=LocalSendOptions(force=True) if use_force else None,
+                # enableDeltas=true — without this, follow-ups sit on RUNNING
+                # with no thinking/tool events until the whole turn finishes.
+                on_delta=lambda _update: None,
+            )
 
             try:
+                self._trace(
+                    f"Cursor send · {len(image_paths)} image(s), "
+                    f"{len(text):,} prompt chars"
+                    + (" (force)" if use_force else "")
+                )
                 run = self._cursor_agent.send(message, send_opts)
-                reply = run.text()
-                result = run.wait()
+                reply, result = _consume_cursor_run(run, status)
             except CursorAgentError as err:
                 context_hit = looks_like_context_error(err)
                 recoverable = allow_recovery and looks_like_recoverable_cursor_error(err)
@@ -1406,7 +1671,9 @@ class DesignAgent:
             self.update_worksheet(pending_prompt=prompt)
         if DESIGN_FILE.exists():
             DESIGN_FILE.unlink()
+        self._trace("Cursor · waiting for agent to write generated/current_design.py")
         text = self._send_cursor(prompt, images=images)
+        self._trace("Cursor · loading design source")
         return self._load_design_code(assistant_text=text)
 
     def _load_design_code(self, assistant_text: str) -> str:
@@ -1470,6 +1737,7 @@ class DesignAgent:
 
     def generate(self, prompt: str) -> str:
         """Create an initial design from a natural-language brief."""
+        self._trace("Generate · starting initial design")
         self.history = [{"role": "user", "content": prompt}]
         req = prompt.strip()
         if self.references:
@@ -1486,10 +1754,12 @@ class DesignAgent:
         feature_block = format_feature_list(self.features)
         self.update_worksheet(phase="generate", task_instruction=prompt.strip())
         if self.backend == "mock":
+            self._trace("Generate · mock backend")
             code = self._mock_code(prompt, revision=False)
             GENERATED_DIR.mkdir(parents=True, exist_ok=True)
             DESIGN_FILE.write_text(code.rstrip() + "\n", encoding="utf-8")
         else:
+            self._trace("Generate · sending brief to Cursor")
             code = self._run_cursor(
                 f"{SYSTEM_BRIEF}\n\n"
                 f"{self._prompt_references()}"
@@ -1519,6 +1789,8 @@ class DesignAgent:
         if not self.current_code:
             return self.generate(instruction)
 
+        self._trace("Revise · follow-up instruction")
+
         scope_name = (scope or WHOLE_DESIGN).strip() or WHOLE_DESIGN
         scoped = scope_name not in {WHOLE_DESIGN, "", "whole", "assembly", "all"}
 
@@ -1533,6 +1805,7 @@ class DesignAgent:
             self.last_requirements = instruction.strip()
 
         self.sync_features(instruction, replace=False)
+        self._trace("Revise · feature checklist updated")
         feature_block = format_feature_list(self.features)
         self.update_worksheet(
             phase="revise",
@@ -1553,6 +1826,7 @@ class DesignAgent:
             {"role": "assistant", "content": f"[features]\n{feature_block}"}
         )
         if self.backend == "mock":
+            self._trace("Revise · mock backend")
             code = self._mock_code(instruction, revision=True)
             DESIGN_FILE.write_text(code.rstrip() + "\n", encoding="utf-8")
             if self._vertices is not None:
@@ -1569,17 +1843,17 @@ class DesignAgent:
                     "EDIT SCOPE: whole design — you may update any parts, but keep a coherent "
                     "parts() dict and build() assembly.\n"
                 )
+            self._trace("Revise · sending instruction to Cursor (follow-up on same agent)")
             code = self._run_cursor(
                 f"{SYSTEM_BRIEF}\n\n"
                 f"Revise the existing design in {DESIGN_FILE.relative_to(ROOT)}.\n"
                 f"{scope_block}\n"
-                f"{self._prompt_references()}"
+                f"{self._prompt_references(compact=True)}"
                 f"Key features that must remain satisfied (updated):\n{feature_block}\n\n"
                 f"Current source for reference:\n```python\n{self.current_code}\n```\n\n"
-                f"Study the attached RGB renders. If you need another angle, call "
-                f"render_cad_view first.\n"
-                f"Then apply this revision and overwrite the file with the full updated "
-                f"parts()/build() source:\n{instruction}",
+                f"If RGB renders are attached, use them for proportions. Do not open "
+                f".step files. Then apply this revision and overwrite the file with the "
+                f"full updated parts()/build() source:\n{instruction}",
                 images=render_paths,
             )
         self.current_code = code
@@ -1659,9 +1933,10 @@ class DesignAgent:
             phase="debug",
             task_instruction=f"Fix CadQuery build error: {err.splitlines()[0][:200]}",
         )
+        self._trace("Debug · sending CadQuery error back to Cursor")
         prompt = (
             f"{DEBUG_BRIEF}\n\n"
-            f"{self._prompt_references()}"
+            f"{self._prompt_references(compact=True)}"
             f"Broken source:\n```python\n{broken_code}\n```\n\n"
             f"Error traceback:\n```\n{err}\n```\n\n"
             f"Overwrite {DESIGN_FILE.relative_to(ROOT)} with the corrected full build() source."
@@ -1849,7 +2124,7 @@ class DesignAgent:
 
         prompt = (
             f"{REVIEW_BRIEF}\n\n"
-            f"{self._prompt_references()}"
+            f"{self._prompt_references(compact=True)}"
             f"User requirements / brief:\n{requirements or '(none provided)'}\n\n"
             f"Key feature checklist (evaluate EVERY item):\n{feature_block}\n\n"
             f"Measured geometry:\n{geo}\n"
@@ -1905,7 +2180,7 @@ class DesignAgent:
 
         prompt = (
             f"{REFINE_BRIEF}\n\n"
-            f"{self._prompt_references()}"
+            f"{self._prompt_references(compact=True)}"
             f"User requirements / brief:\n{requirements or '(none)'}\n\n"
             f"Feature checklist status:\n{feature_block}\n\n"
             f"UNMET features to implement:\n{unmet_block}\n\n"
@@ -1939,19 +2214,26 @@ class DesignAgent:
             geometry=geometry_summary or None,
         )
 
-        render_paths = list(images or [])
-        if not render_paths and self._vertices is not None:
-            render_paths = self.render_views(views or DEFAULT_VIEWS)
+        # Explicit images=[] means text-only. Do not auto-capture RGB on Ask —
+        # follow-up image+STEP payloads stall the local Cursor agent.
+        if images is not None:
+            render_paths = list(images)
+        elif views and self._vertices is not None:
+            render_paths = self.render_views(views)
+        else:
+            render_paths = []
 
         snapshot = DESIGN_FILE.read_text(encoding="utf-8") if DESIGN_FILE.exists() else None
 
         if self.backend == "mock":
+            self._trace("Ask · mock backend")
             answer = self._mock_ask(
                 question,
                 geometry_summary=geometry_summary,
                 images=render_paths,
             )
         else:
+            self._trace("Ask · sending question to Cursor (follow-up on same agent)")
             answer = self._ask_cursor(
                 question,
                 geometry_summary=geometry_summary,
@@ -1977,18 +2259,14 @@ class DesignAgent:
     ) -> str:
         prompt = (
             f"{ASK_BRIEF}\n\n"
-            f"{self._prompt_references()}"
+            f"{self._prompt_references(compact=True)}"
             f"Current CadQuery source (read-only):\n```python\n{self.current_code}\n```\n\n"
         )
         if self.features:
             prompt += f"Key feature checklist:\n{format_feature_status(self.features)}\n\n"
         if geometry_summary:
             prompt += f"Measured geometry:\n{geometry_summary}\n\n"
-        prompt += (
-            "If the attached views are not enough, call render_cad_view for another angle, "
-            "then answer.\n\n"
-            f"Question:\n{question}"
-        )
+        prompt += f"Question:\n{question}"
         return self._send_cursor(prompt, images=images)
 
     def _mock_ask(

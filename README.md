@@ -107,19 +107,19 @@ Load a STEP **before the first prompt** (Load STEP… on the start dialog) or la
 
 The agent does not only display the file. It:
 
-- Copies it to `generated/references/<name>.step`
+- Copies it to `generated/references/<name>.step` (kept out of the Cursor agent via `.cursorignore`)
 - Extracts bbox, volume, solid count, face types, and cylinder radii (holes/shafts)
 - Writes `generated/references/<name>.md` and injects those facts into generate / revise / Ask / review
 - Can use the exact B-rep in CadQuery via `import_reference("name")` (injected at runtime)
 
-The live design stays parametric CadQuery. The imported STEP is a constraint (mate, envelope, matching holes). A translucent overlay in the 3D view shows the reference next to the current design.
+The live design stays parametric CadQuery. The imported STEP is a constraint (mate, envelope, matching holes). A translucent overlay in the 3D view shows the reference next to the current design. The agent is told **not** to open the binary STEP — only the measured facts and `import_reference()`.
 
 - **Edit scope** (Agent tab) — apply a revision to the whole design or one part  
 
 ### Agent vs Ask
 
 - **Agent** — language edits that rewrite CadQuery and rebuild  
-- **Ask** — read-only Q&A about dimensions / structure (uses RGB views)
+- **Ask** — read-only Q&A about dimensions / structure (source + measured facts; no RGB by default)
 
 ### Version history
 

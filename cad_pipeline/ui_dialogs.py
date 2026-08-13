@@ -51,9 +51,9 @@ def ask_initial_prompt(parent: tk.Tk | None = None) -> InitialBrief | None:
     root = parent or tk.Tk()
     if owns_root:
         apply_scaling(root)
-        c = colors(root)
-        root.title("AI CAD Design")
-        root.configure(bg=c["bg"])
+    c = colors(root)
+    root.title("AI CAD Design")
+    root.configure(bg=c["bg"])
 
     result: dict[str, InitialBrief | None] = {"brief": None}
     step_paths: list[Path] = []
@@ -165,19 +165,35 @@ def ask_initial_prompt(parent: tk.Tk | None = None) -> InitialBrief | None:
     root.bind("<Control-Return>", submit)
     root.protocol("WM_DELETE_WINDOW", cancel)
 
+    fit_window(
+        root,
+        min_width=scaled(root, 720),
+        min_height=scaled(root, 580),
+        pad=scaled(root, 28),
+    )
+    try:
+        root.deiconify()
+    except tk.TclError:
+        pass
+    root.mainloop()
+    brief = result["brief"]
     if owns_root:
-        fit_window(
-            root,
-            min_width=scaled(root, 720),
-            min_height=scaled(root, 580),
-            pad=scaled(root, 28),
-        )
-        root.mainloop()
         try:
             root.destroy()
         except tk.TclError:
             pass
-    return result["brief"]
+    else:
+        for child in list(root.winfo_children()):
+            try:
+                child.destroy()
+            except tk.TclError:
+                pass
+        if brief is not None:
+            try:
+                root.withdraw()
+            except tk.TclError:
+                pass
+    return brief
 
 
 def ask_save_name(

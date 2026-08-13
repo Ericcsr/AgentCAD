@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Callable
 
-from cad_pipeline.agent import DesignAgent
+from cad_pipeline.agent import DesignAgent, _HEARTBEAT_PREFIX
 from cad_pipeline.mesh_utils import geometry_summary, mesh_bbox_summary
 from cad_pipeline.render import RENDER_DIR
 from cad_pipeline.runtime import (
@@ -47,6 +48,7 @@ class DesignStudio:
         *,
         models_dir: Path,
         on_status: Callable[[str], None] | None = None,
+        root: tk.Tk | None = None,
     ) -> None:
         self.agent = agent
         self.result = initial
@@ -57,9 +59,24 @@ class DesignStudio:
         self.mode = MODE_AGENT
         self.view_scope = WHOLE_DESIGN
         self.edit_scope = WHOLE_DESIGN
+        self._busy_t0 = 0.0
+        self._busy_phase = ""
+        self._busy_tick_id: str | None = None
 
-        self.root = tk.Tk()
-        apply_scaling(self.root)
+        if root is None:
+            self.root = tk.Tk()
+            apply_scaling(self.root)
+        else:
+            self.root = root
+            for child in list(self.root.winfo_children()):
+                try:
+                    child.destroy()
+                except tk.TclError:
+                    pass
+            try:
+                self.root.deiconify()
+            except tk.TclError:
+                pass
         c = colors(self.root)
         self.root.title("AI CAD Studio")
         self.root.configure(bg=c["bg"])
@@ -210,6 +227,16 @@ class DesignStudio:
         self.version_combo.pack(side=tk.LEFT, padx=(0, scaled(self.root, 6)))
         self.rollback_btn = ttk.Button(hist_wrap, text="Rollback", command=self._on_rollback)
         self.rollback_btn.pack(side=tk.LEFT)
+
+        self.process = ttk.Label(header, text="", style="Hint.TLabel", justify=tk.LEFT)
+        self.process.grid(
+            row=2,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(scaled(self.root, 6), 0),
+        )
+        self.process.configure(wraplength=scaled(self.root, 1100))
 
         self._version_labels: list[str] = []
         self._version_ids: list[str] = []
@@ -449,6 +476,7 @@ class DesignStudio:
         self.log.tag_configure("assistant", foreground=c["assistant"], font=(family, size))
         self.log.tag_configure("ask", foreground=c["ask"], font=(family, size))
         self.log.tag_configure("system", foreground=c["system"], font=(family, max(10, size - 1)))
+        self.log.tag_configure("trace", foreground=c.get("trace", c["system"]), font=(family, max(10, size - 1)))
         self.log.tag_configure("error", foreground=c["error"], font=(family, size))
         self.log.tag_configure("gap", spacing3=scaled(self.root, 10))
 
@@ -543,9 +571,13 @@ class DesignStudio:
             f"Parts: {names}\n"
             f"{base}"
         )
-        refs = self.agent.references_block()
+        refs = self.agent.references
         if refs:
-            block += "\n\n" + refs
+            names = ", ".join(f"`{r.name}`" for r in refs)
+            block += (
+                f"\nImported STEP constraints: {names} "
+                "(measured facts already in the agent prompt; do not read STEP files)."
+            )
         return block
 
     def _capture_current_view(self) -> Path | None:
@@ -555,23 +587,28 @@ class DesignStudio:
         except Exception:
             return None
 
-    def _prepare_agent_images(self) -> list[Path]:
-        self.agent.set_mesh(self.result.vertices, self.result.faces)
-        paths: list[Path] = []
-        current = self._capture_current_view()
-        if current is not None:
-            paths.append(current)
-        # Reuse the same preview OpenGL context (not a second MeshRenderer)
-        for result in self.preview.render_views(("isometric", "front", "side")):
-            paths.append(result.path)
-        seen: set[str] = set()
-        unique: list[Path] = []
-        for p in paths:
-            key = str(p.resolve())
-            if key not in seen:
-                seen.add(key)
-                unique.append(p)
-        return unique
+    def _prepare_agent_images(self, *, views: tuple[str, ...] = ("isometric",)) -> list[Path]:
+        # Hide the imported STEP overlay while capturing — dense tessellations
+        # make huge PNGs and stall the local Cursor agent on follow-up turns.
+        self.preview.set_reference_meshes([], reset_camera=False)
+        try:
+            self.agent.set_mesh(self.result.vertices, self.result.faces)
+            paths: list[Path] = []
+            current = self._capture_current_view()
+            if current is not None:
+                paths.append(current)
+            for result in self.preview.render_views(views):
+                paths.append(result.path)
+            seen: set[str] = set()
+            unique: list[Path] = []
+            for p in paths:
+                key = str(p.resolve())
+                if key not in seen:
+                    seen.add(key)
+                    unique.append(p)
+            return unique
+        finally:
+            self._refresh_reference_overlay(reset_camera=False)
 
     # --- logging / busy -----------------------------------------------------
 
@@ -584,6 +621,52 @@ class DesignStudio:
 
     def _log_system(self, message: str) -> None:
         self._append_log(message, "system")
+
+    def _log_trace(self, message: str) -> None:
+        self._append_log(message, "trace")
+
+    def _on_agent_status(self, message: str) -> None:
+        """Live process updates from the design agent (marshalled to the UI thread)."""
+        quiet = message.startswith(_HEARTBEAT_PREFIX)
+        text = message[len(_HEARTBEAT_PREFIX) :].strip() if quiet else message.strip()
+        if not text:
+            return
+        self._busy_phase = text
+        self._refresh_busy_label()
+        if not quiet:
+            self._log_trace(text)
+
+    def _refresh_busy_label(self) -> None:
+        if self._closed:
+            return
+        elapsed = int(time.monotonic() - self._busy_t0) if self._busy and self._busy_t0 else 0
+        phase = self._busy_phase or ("Working…" if self._busy else "")
+        if self._busy:
+            short = phase if len(phase) <= 44 else "…" + phase[-43:]
+            self.status.configure(text=f"{short}  {elapsed}s")
+            if hasattr(self, "process"):
+                self.process.configure(text=f"{phase}   ·  {elapsed}s elapsed")
+        elif phase:
+            self.status.configure(text=phase)
+            if hasattr(self, "process"):
+                self.process.configure(text="")
+
+    def _schedule_busy_tick(self) -> None:
+        if self._busy_tick_id is not None:
+            try:
+                self.root.after_cancel(self._busy_tick_id)
+            except tk.TclError:
+                pass
+            self._busy_tick_id = None
+        if self._busy and not self._closed:
+            self._busy_tick_id = self.root.after(1000, self._on_busy_tick)
+
+    def _on_busy_tick(self) -> None:
+        self._busy_tick_id = None
+        if not self._busy or self._closed:
+            return
+        self._refresh_busy_label()
+        self._schedule_busy_tick()
 
     def _log_user(self, message: str) -> None:
         self._append_log(message, "user")
@@ -620,8 +703,18 @@ class DesignStudio:
             self.notebook.state(["!disabled"] if not busy else ["disabled"])
         except tk.TclError:
             pass
-        if status:
-            self.status.configure(text=status)
+        if busy:
+            self._busy_t0 = time.monotonic()
+            self._busy_phase = status or "Working…"
+            self._refresh_busy_label()
+            self._schedule_busy_tick()
+        else:
+            self._busy_phase = status or ""
+            self._schedule_busy_tick()
+            if status:
+                self.status.configure(text=status)
+            if hasattr(self, "process"):
+                self.process.configure(text="")
 
     # --- actions ------------------------------------------------------------
 
@@ -647,23 +740,28 @@ class DesignStudio:
         self._log_user(f"You · {instruction}")
         if self.edit_scope != WHOLE_DESIGN:
             self._log_system(f"Edit scope · part `{self.edit_scope}`")
-        images = self._prepare_agent_images()
-        self._log_system("Sent RGB renders to agent: " + ", ".join(p.name for p in images))
+        self._on_agent_status("Studio · capturing RGB views for the agent (no STEP overlay)…")
+        images = self._prepare_agent_images(views=("isometric",))
+        self._on_agent_status(
+            "Studio · attached RGB renders: " + ", ".join(p.name for p in images)
+        )
+
+        def status(msg: str) -> None:
+            self.root.after(0, lambda m=msg: self._on_agent_status(m))
 
         def work() -> None:
             err: str | None = None
             new_result: DesignResult | None = None
+            prev_hook = self.agent._status_hook
+            self.agent.set_status_hook(status)
             try:
+                status("Agent · revise: sending follow-up to Cursor…")
                 code = self.agent.revise(
                     instruction,
                     images=images,
                     scope=self.edit_scope,
                 )
-
-                def status(msg: str) -> None:
-                    self.root.after(0, lambda m=msg: self._log_system(m))
-
-                # Build (+ full review only in Refinement mode)
+                status("Agent · revise: building CadQuery…")
                 new_result = self.agent.finalize_design(
                     code,
                     images=images,
@@ -671,6 +769,8 @@ class DesignStudio:
                 )
             except Exception as exc:  # noqa: BLE001
                 err = str(exc)
+            finally:
+                self.agent.set_status_hook(prev_hook)
 
             def done() -> None:
                 if self._closed:
@@ -716,16 +816,23 @@ class DesignStudio:
         self._set_busy(True, "Ask · Thinking…")
         self._log_user(f"You · {question}")
         geo = self._geometry_context()
-        images = self._prepare_agent_images()
-        self._log_system("Sent RGB renders to agent: " + ", ".join(p.name for p in images))
+        self._on_agent_status("Ask · text-only (no RGB / no STEP files)")
+
+        def status(msg: str) -> None:
+            self.root.after(0, lambda m=msg: self._on_agent_status(m))
 
         def work() -> None:
             err: str | None = None
             answer: str | None = None
+            prev_hook = self.agent._status_hook
+            self.agent.set_status_hook(status)
             try:
-                answer = self.agent.ask(question, geometry_summary=geo, images=images)
+                status("Ask · sending question to Cursor…")
+                answer = self.agent.ask(question, geometry_summary=geo, images=[])
             except Exception as exc:  # noqa: BLE001
                 err = str(exc)
+            finally:
+                self.agent.set_status_hook(prev_hook)
 
             def done() -> None:
                 if self._closed:
@@ -1060,6 +1167,12 @@ class DesignStudio:
         if self._closed:
             return
         self._closed = True
+        if self._busy_tick_id is not None:
+            try:
+                self.root.after_cancel(self._busy_tick_id)
+            except tk.TclError:
+                pass
+            self._busy_tick_id = None
         try:
             self.agent.close()
         except Exception:

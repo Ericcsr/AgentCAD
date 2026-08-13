@@ -23,6 +23,7 @@ COLORS = {
     "assistant": "#3d342c",
     "ask": "#2f4a3c",
     "system": "#6b645a",
+    "trace": "#4a6678",
     "error": "#8b2e2e",
     "status_bg": "#e7e1d6",
 }

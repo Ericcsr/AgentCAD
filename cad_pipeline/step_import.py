@@ -272,9 +272,8 @@ def import_step_file(
         [
             f"# Reference STEP `{name}`",
             "",
-            f"- source: `{path}`",
-            f"- staged: `generated/references/{name}.step`",
             f"- CadQuery: `import_reference(\"{name}\")`  (injected at runtime)",
+            "- Do not open the binary STEP; facts below are already measured.",
             "",
             summary,
             "",
@@ -298,26 +297,33 @@ def import_step_file(
     )
 
 
-def format_references_block(refs: list[StepReference]) -> str:
-    """Prompt / worksheet block describing imported STEP constraints."""
+def format_references_block(refs: list[StepReference], *, compact: bool = False) -> str:
+    """Prompt / worksheet block describing imported STEP constraints.
+
+    Never include .step/.stp paths — the local Cursor agent will try to read
+    those binaries on follow-up turns and hang.
+    """
     if not refs:
         return ""
     lines = [
         "Imported STEP references (design constraints — not the live CadQuery design):",
-        "Use these measured facts. To load a solid in parts()/build(), call "
-        "import_reference(\"name\") which is injected at runtime.",
+        "Use the measured facts below. Do NOT open or read any .step/.stp files.",
+        "To use the exact B-rep in CadQuery, call import_reference(\"name\") "
+        "(injected at runtime).",
         "Prefer matching dimensions parametrically; import the B-rep only when you need "
         "the exact shape (mate, cut, envelope).",
         "",
     ]
     for ref in refs:
-        rel = ref.staged_path
+        facts_rel = ref.facts_path
         try:
-            rel = ref.staged_path.relative_to(ROOT)
+            facts_rel = ref.facts_path.relative_to(ROOT)
         except ValueError:
             pass
-        lines.append(f"## `{ref.name}`  ({rel})")
-        lines.append(f"source: {ref.source_path}")
+        lines.append(f"## `{ref.name}`")
+        if not compact:
+            lines.append(f"facts: `{facts_rel}`")
+        lines.append(f'CadQuery: import_reference("{ref.name}")')
         lines.append(ref.summary)
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"

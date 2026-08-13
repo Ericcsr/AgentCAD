@@ -32,6 +32,7 @@ Optional env (.env supported):
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import sys
 import threading
 import tkinter as tk
@@ -39,20 +40,28 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Callable
 
+faulthandler.enable()
+
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from cad_pipeline.agent import DesignAgent
 from cad_pipeline.models import DEFAULT_MODEL, model_help_text, resolve_model
-from cad_pipeline.studio import DesignStudio
 from cad_pipeline.ui_dialogs import ask_initial_prompt
 from cad_pipeline.ui_scale import apply_scaling, colors, fit_window, fonts, scaled
 
 
-def _show_progress(message: str = "Designing…") -> tuple[tk.Tk, Callable[[str], None], Callable[[], None]]:
-    root = tk.Tk()
-    apply_scaling(root)
+def _clear_root(root: tk.Tk) -> None:
+    for child in list(root.winfo_children()):
+        try:
+            child.destroy()
+        except tk.TclError:
+            pass
+
+
+def _show_progress(root: tk.Tk, message: str = "Designing…") -> tuple[Callable[[str], None], Callable[[], None]]:
+    """Reuse the same Tk root — a second Tk() after VTK is loaded segfaults on Linux."""
+    _clear_root(root)
     f = fonts(root)
     c = colors(root)
     root.title("AI CAD Design")
@@ -83,21 +92,36 @@ def _show_progress(message: str = "Designing…") -> tuple[tk.Tk, Callable[[str]
         except tk.TclError:
             pass
 
+    root.protocol("WM_DELETE_WINDOW", close)
     fit_window(
         root,
         min_width=scaled(root, 560),
         min_height=scaled(root, 180),
         pad=scaled(root, 20),
     )
-    return root, set_message, close
+    root.deiconify()
+    return set_message, close
 
 
 def run_pipeline(*, fast: bool | None = None, model: str | None = None) -> int:
     models_dir = ROOT / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
 
-    brief = ask_initial_prompt()
+    # Create Tk before importing VTK/OCP. Destroying one Tk() and creating
+    # another after vtk is loaded is a common Linux segfault.
+    root = tk.Tk()
+    root.withdraw()
+    apply_scaling(root)
+
+    from cad_pipeline.agent import DesignAgent
+    from cad_pipeline.studio import DesignStudio
+
+    brief = ask_initial_prompt(root)
     if not brief:
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
         print("Cancelled.")
         return 0
     prompt = brief.prompt
@@ -111,64 +135,83 @@ def run_pipeline(*, fast: bool | None = None, model: str | None = None) -> int:
     print(
         f"LLM backend: {agent.backend}  model={agent.model}  "
         f"fast={'on' if agent.fast else 'off'}  "
-        f"mode={agent.mode_label()}"
+        f"mode={agent.mode_label()}",
+        flush=True,
     )
     if step_paths:
-        print("STEP references:", ", ".join(p.name for p in step_paths))
+        print("STEP references:", ", ".join(p.name for p in step_paths), flush=True)
 
-    progress, set_message, close_progress = _show_progress("Generating initial design…")
+    set_message, close_progress = _show_progress(root, "Generating initial design…")
     # VTK OpenGL must run on the Tk thread — marshal agent renders here until Studio takes over
-    agent.set_ui_marshal(lambda fn: progress.after(0, fn))
+    agent.set_ui_marshal(lambda fn: root.after(0, fn))
+
+    def _progress_status(msg: str) -> None:
+        text = msg[2:].strip() if msg.startswith("~ ") else msg
+        if len(text) > 90:
+            text = "…" + text[-89:]
+        root.after(0, lambda m=text: set_message(m))
+
+    agent.set_status_hook(_progress_status)
     holder: dict = {"result": None, "error": None}
 
     def work() -> None:
         try:
             if step_paths:
-                progress.after(0, lambda: set_message("Reading STEP reference(s)…"))
+                root.after(0, lambda: set_message("Reading STEP reference(s)…"))
                 for path in step_paths:
                     agent.add_step_reference(path)
-            progress.after(0, lambda: set_message("Asking design agent…"))
+            root.after(0, lambda: set_message("Asking design agent…"))
             code = agent.generate(prompt)
             result = agent.finalize_design(
                 code,
                 requirements=prompt,
-                on_status=lambda msg: progress.after(0, lambda m=msg: set_message(m)),
+                on_status=_progress_status,
             )
             holder["result"] = result
         except Exception as exc:  # noqa: BLE001 — surfaced in UI
             holder["error"] = str(exc)
         finally:
-            progress.after(0, close_progress)
+            agent.set_status_hook(None)
+            try:
+                root.after(0, close_progress)
+            except tk.TclError:
+                close_progress()
 
     threading.Thread(target=work, daemon=True).start()
-    progress.mainloop()
-    try:
-        progress.destroy()
-    except tk.TclError:
-        pass
-    # Progress window is gone; Studio will install its own marshal + host renderer
+    root.mainloop()
     agent.set_ui_marshal(None)
 
-    if holder["error"]:
+    def _shutdown_agent() -> None:
         try:
             agent.close()
         except Exception:
             pass
-        err_root = tk.Tk()
-        err_root.withdraw()
-        messagebox.showerror("Design failed", holder["error"], parent=err_root)
-        err_root.destroy()
+
+    if holder["error"]:
+        _shutdown_agent()
+        try:
+            if root.winfo_exists():
+                messagebox.showerror("Design failed", holder["error"], parent=root)
+                root.destroy()
+        except tk.TclError:
+            pass
         print(holder["error"], file=sys.stderr)
         return 1
 
-    studio = DesignStudio(agent, holder["result"], models_dir=models_dir)
+    if holder["result"] is None or not root.winfo_exists():
+        _shutdown_agent()
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
+        print("Cancelled.")
+        return 0
+
+    studio = DesignStudio(agent, holder["result"], models_dir=models_dir, root=root)
     try:
         studio.run()
     finally:
-        try:
-            agent.close()
-        except Exception:
-            pass
+        _shutdown_agent()
     return 0
 
 
