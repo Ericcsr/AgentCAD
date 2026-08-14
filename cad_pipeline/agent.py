@@ -26,6 +26,12 @@ from cad_pipeline.context_worksheet import (
 from cad_pipeline.mesh_utils import geometry_summary
 from cad_pipeline.models import DEFAULT_MODEL, resolve_model
 from cad_pipeline.render import RENDER_DIR, MeshRenderer, list_views
+from cad_pipeline.collision import (
+    assert_compile_feasibility,
+    collision_notes,
+    weld_contact_notes,
+)
+from cad_pipeline.joints import format_joints_block
 from cad_pipeline.runtime import DesignResult, run_design_code
 from cad_pipeline.step_import import (
     StepReference,
@@ -334,6 +340,9 @@ def heuristic_physics_notes(result: DesignResult) -> list[str]:
     axes = sorted(size)
     if axes[0] > 0 and axes[2] / axes[0] > 200:
         notes.append("WARNING: extremely thin aspect ratio — possible paper-thin feature.")
+    notes.extend(collision_notes(result))
+    notes.extend(weld_contact_notes(result))
+    notes.append(format_joints_block(result.joints, result.part_names()))
     return notes
 
 SYSTEM_BRIEF = """You are an expert mechanical CAD designer writing CadQuery (Python) code
@@ -344,6 +353,14 @@ Hard requirements:
 - Define parts() -> dict[str, cq.Workplane] with clear part names (seat, leg_fl, backrest, …)
 - Define build() -> cq.Workplane as the assembled union of parts() (or return the dict from
   build() alone if you prefer — runtime accepts either)
+- For two or more parts, also define joints() -> list[dict] describing the kinematic tree
+  for URDF export. Each item: {type, parent, child} plus optional name, axis, origin,
+  lower, upper (prismatic limits in mm; revolute limits in radians).
+  type is fixed | revolute | prismatic | continuous.
+  Use revolute/prismatic when that motion is part of the product function (hinge, slide,
+  jaw, lid). Use fixed only when parts are actually fastened.
+  Do NOT weld unrelated parts. URDF is a tree — one parent per child. Empty list is OK
+  if nothing is connected. Do not invent a fully-welded chain.
 - Units are millimeters. Z is up. Object sits on the XY floor (z=0).
 - Prefer robust boolean unions of simple boxes/cylinders/extrusions.
 - Do not use `__import__` / `import` in that file. Injected at runtime: `cq` (cadquery),
@@ -362,6 +379,12 @@ CadQuery API tips (avoid common failures):
 Parts:
 - Keep each logical component as its own named entry in parts().
 - build() should union those parts into the full product.
+- Named parts must not interpenetrate. Face contact / mating is OK; overlapping
+  volume is a design failure and will be rejected. Place parts so they meet at
+  faces. Do not merge colliding parts into one body to hide the issue.
+- A fixed/weld joint is only valid if those two parts are in contact. A weld
+  between parts that float apart is a compile failure. Unrelated parts, or parts
+  that are not directly welded, may float.
 - When a revision is scoped to ONE part, change only that part's geometry; keep other
   parts' names and interfaces stable unless the user asks otherwise.
 
@@ -392,6 +415,12 @@ Hard requirements:
 - Keep the user's design intent; only fix the error (and closely related issues).
 - Prefer simple CadQuery patterns: box/cylinder/extrude + union/cut + Workplane.rotate/translate.
 - Keep a parts() dict of named components when the design has multiple pieces.
+- If the error is a part collision, separate the listed pairs so they no longer
+  occupy the same volume. Face contact is OK. Keep the same parts() keys.
+- If the error is a floating weld, move the listed pair into contact or remove
+  that fixed joint. Do not weld parts that do not touch.
+- If the error is about joints(), add or fix joints() only for parts that are
+  actually related. Do not weld unrelated parts.
 - Do NOT use Vector.rotate — use Workplane.rotate(axisStart, axisEnd, angleDegrees).
 - After writing the fixed file, reply with a one-line confirmation.
 """
@@ -423,6 +452,8 @@ Check all of the following:
    - Stable support (legs/base) for furniture-like objects
    - Feature sizes plausible; no paper-thin walls or absurd scales unless requested
    - Parts that should touch should not have large unintended gaps
+   - Named parts must not interpenetrate (collision check is also run geometrically)
+   - Each fixed/weld joint must be in contact; floating welds fail compilation
 
 Output format — EXACTLY like this (no markdown fences):
 FEATURES_CHECK:
@@ -481,6 +512,7 @@ Hard requirements:
 - Address EVERY listed ACTION / ISSUE from the review while keeping the user's brief.
 - Satisfy every UNMET key feature listed in the checklist.
 - Prefer robust CadQuery patterns (box/cylinder/extrude + union/cut + Workplane.rotate/translate).
+- Keep or update joints() so the URDF tree matches the product. Do not weld unrelated parts.
 - Do NOT use Vector.rotate.
 - After writing the file, reply with a one-line confirmation.
 """
@@ -532,7 +564,7 @@ MOCK_CHAIR = '''def parts():
     }.items():
         out[label] = (
             cq.Workplane("XY")
-            .box(LEG_W, LEG_W, SEAT_H, centered=(True, True, False))
+            .box(LEG_W, LEG_W, SEAT_H - SEAT_T, centered=(True, True, False))
             .translate((x, y, 0))
         )
     out["stretcher_l"] = (
@@ -581,6 +613,18 @@ MOCK_CHAIR = '''def parts():
     out["backrest"] = union(back).rotate((0, half_d, SEAT_H), (1, half_d, SEAT_H), BACK_RECLINE)
     return out
 
+def joints():
+    return [
+        {"type": "fixed", "parent": "seat", "child": "leg_fl"},
+        {"type": "fixed", "parent": "seat", "child": "leg_fr"},
+        {"type": "fixed", "parent": "seat", "child": "leg_bl"},
+        {"type": "fixed", "parent": "seat", "child": "leg_br"},
+        {"type": "fixed", "parent": "seat", "child": "backrest"},
+        {"type": "fixed", "parent": "leg_fl", "child": "stretcher_l"},
+        {"type": "fixed", "parent": "leg_fr", "child": "stretcher_r"},
+        {"type": "fixed", "parent": "leg_fl", "child": "stretcher_f"},
+    ]
+
 def build():
     p = parts()
     solid = None
@@ -614,6 +658,14 @@ MOCK_TABLE = '''def parts():
             .translate((x, y, 0))
         )
     return out
+
+def joints():
+    return [
+        {"type": "fixed", "parent": "top", "child": "leg_fl"},
+        {"type": "fixed", "parent": "top", "child": "leg_fr"},
+        {"type": "fixed", "parent": "top", "child": "leg_bl"},
+        {"type": "fixed", "parent": "top", "child": "leg_br"},
+    ]
 
 def build():
     p = parts()
@@ -1765,7 +1817,8 @@ class DesignAgent:
                 f"{self._prompt_references()}"
                 f"Key features to satisfy:\n{feature_block}\n\n"
                 f"Create a NEW CadQuery design for this brief:\n{prompt}\n\n"
-                f"Write it to {DESIGN_FILE.relative_to(ROOT)} now."
+                f"Write parts(), build(), and (if there are 2+ parts) joints() to "
+                f"{DESIGN_FILE.relative_to(ROOT)} now."
             )
         self.current_code = code
         self.history.append({"role": "assistant", "content": code})
@@ -1886,6 +1939,10 @@ class DesignAgent:
             status(f"Building geometry (attempt {attempt}/{attempts})…")
             try:
                 result = run_design_code(current)
+                if _env_flag("DESIGN_COLLISION", True) and len(result.parts) >= 2:
+                    status(f"Feasibility · collision + weld contact ({len(result.parts)} parts)…")
+                    assert_compile_feasibility(result)
+                    status(f"Feasibility · PASS ({len(result.parts)} parts)")
                 self.current_code = result.code
                 DESIGN_FILE.parent.mkdir(parents=True, exist_ok=True)
                 DESIGN_FILE.write_text(result.code.rstrip() + "\n", encoding="utf-8")
@@ -1987,7 +2044,7 @@ class DesignAgent:
             self.set_mesh(result.vertices, result.faces)
 
             if self.is_draft_mode():
-                status("Drafting mode — build OK, skipping constraint review.")
+                status("Drafting mode — build + feasibility OK, skipping feature review.")
                 if not self.features and req:
                     self.sync_features(req, replace=True)
                 self.update_worksheet(phase="draft_ready", task_instruction=req)
@@ -2144,16 +2201,28 @@ class DesignAgent:
             elif DESIGN_FILE.read_text(encoding="utf-8") != snapshot:
                 DESIGN_FILE.write_text(snapshot, encoding="utf-8")
         outcome = parse_review(raw, features=self.features)
-        # If the model omitted VERDICT but physics has hard warnings, treat as fail
-        if outcome.passed and any(n.startswith("WARNING") for n in physics):
-            if "PASS" not in (raw or "").upper():
-                outcome = ReviewOutcome(
-                    passed=False,
-                    raw=raw,
-                    issues=outcome.issues or [n for n in physics if n.startswith("WARNING")],
-                    actions=outcome.actions or ["Resolve the geometric warnings listed above."],
-                    feature_results=outcome.feature_results,
-                )
+        hard = [n for n in physics if n.startswith("WARNING")]
+        collision_fail = any("Collision check FAIL" in n for n in physics)
+        weld_fail = any("Weld contact FAIL" in n for n in physics)
+        # Geometric feasibility always fails review, even if the model said PASS.
+        if outcome.passed and (
+            collision_fail or weld_fail or (hard and "PASS" not in (raw or "").upper())
+        ):
+            if collision_fail:
+                default_actions = ["Separate overlapping named parts so they only meet at faces."]
+            elif weld_fail:
+                default_actions = [
+                    "Bring each welded pair into contact, or drop the floating fixed joint."
+                ]
+            else:
+                default_actions = ["Resolve the geometric warnings listed above."]
+            outcome = ReviewOutcome(
+                passed=False,
+                raw=raw,
+                issues=outcome.issues or hard,
+                actions=outcome.actions or default_actions,
+                feature_results=outcome.feature_results,
+            )
         return outcome
 
     def _refine_from_review(

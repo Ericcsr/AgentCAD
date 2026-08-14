@@ -69,6 +69,47 @@ python start_design.py
 3. The **Studio** opens — orbit the model, revise in **Agent**, ask questions in **Ask**.
 4. **Ctrl+S** saves STEP + matching `.py` under `models/`.
 
+### Studio
+
+![AI CAD Studio — 3D preview on the left, Agent/Ask chat on the right](docs/images/studio.png)
+
+Orbit the solid on the left. Revise in **Agent**, inspect dimensions in **Ask**, switch **Drafting / Refinement**, and roll back from **History**.
+
+### Example designs
+
+Renders from designs produced in this repo (parametric CadQuery → tessellated preview).
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="docs/images/chair.png" alt="Wooden dining chair with slatted backrest" />
+      <br /><em>Dining chair</em> — named parts, fixed welds, no collisions
+    </td>
+    <td align="center" width="50%">
+      <img src="docs/images/table.png" alt="Four-leg table" />
+      <br /><em>Table</em> — top + four legs, face-contact welds
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="docs/images/gripper.png" alt="Parallel-jaw robot gripper" />
+      <br /><em>Parallel-jaw gripper</em> — flange, housing, sliding fingers
+    </td>
+    <td align="center">
+      <img src="docs/images/nut_bolt.png" alt="Hex bolt and matching nut" />
+      <br /><em>Bolt and nut</em> — two parts, not welded (floating is allowed)
+    </td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2">
+      <img src="docs/images/propeller.png" alt="Three-blade trolling-motor propeller" width="560" />
+      <br /><em>Trolling-motor propeller</em> — lofted blades on a hub
+    </td>
+  </tr>
+</table>
+
+Regenerate these images with `python docs/render_readme_images.py`.
+
 ### Useful flags
 
 ```bash
@@ -88,8 +129,15 @@ DESIGN_LLM=mock python start_design.py   # offline demo, no API key
 
 ### Modes (header)
 
-- **Drafting** (default) — stop once the design compiles and renders. Fast iteration.
+- **Drafting** (default) — stop once the design compiles, renders, parts do not collide, and welded pairs touch. Fast iteration.
 - **Refinement** — after each build, check key features + physics; refine until pass or budget ends.
+
+After every successful build with two or more named parts, compile-time feasibility runs:
+
+- **Collision** — overlapping volume between named parts is a failure (face contact is OK)
+- **Weld contact** — each `fixed` joint must be in contact. Unrelated parts, or parts that are not *directly* welded, may float
+
+Either failure is treated like a compile error and the agent is asked to rebuild.
 
 ### Parts
 
@@ -99,7 +147,10 @@ Designs should expose named parts via `parts()` (assembly in `build()`).
 - **Export part STEP** / **Export all STEP** — separate STEP files  
 - **Export part STL** — single-part triangle mesh  
 - **ZIP all STLs** — folder of part meshes + a `.zip` under `models/`  
+- **Export URDF** — package folder with `*.urdf` + per-part STL meshes  
 - **Import STEP** — add an existing STEP as agent context (ghost overlay in the preview)
+
+Multi-part designs must define `joints()`: a tree of `{type, parent, child}` relations for the URDF. Use `revolute` / `prismatic` when that motion is part of the product function. Use `fixed` only for parts that are actually fastened. Unrelated parts are left unwelded (separate roots).
 
 ### Imported STEP references
 
@@ -151,7 +202,8 @@ Copy from `.env.example`. Common variables:
 | `DESIGN_LLM` | `auto` | `auto` \| `cursor` \| `mock` |
 | `DESIGN_MODE` | `draft` | `draft` \| `refine` |
 | `DESIGN_FAST` | off | `1` / `true` → model `fast=true` |
-| `DESIGN_DEBUG_RETRIES` | `5` | Build → debug cycles |
+| `DESIGN_DEBUG_RETRIES` | `5` | Build → debug / collision-fix cycles |
+| `DESIGN_COLLISION` | on | `0` / `false` to skip compile-time collision + weld-contact checks |
 | `DESIGN_REVIEW_ROUNDS` | `3` | Review → refine rounds (refine mode) |
 | `DESIGN_AGENT_RECOVERIES` | `3` | Worksheet relaunches per failed send |
 | `DESIGN_UI_SCALE` | auto | Override HiDPI UI scale (e.g. `2.0`) |
@@ -181,10 +233,13 @@ AgentCAD/
 ├── cad_pipeline/
 │   ├── agent.py             # Cursor/mock agent, review, recovery
 │   ├── runtime.py           # Execute CadQuery, parts, STEP export
+│   ├── joints.py            # joints() parse / URDF tree validation
+│   ├── urdf.py              # URDF + mesh package export
 │   ├── studio.py            # Tk + VTK interactive UI
 │   ├── versioning.py        # Design / chat snapshots
 │   ├── context_worksheet.py # Crash-recovery memory
 │   └── ...
+├── docs/images/             # README studio + design gallery
 ├── generated/               # Working design, renders, versions (gitignored)
 └── models/                  # Saved STEP + .py exports
 ```
@@ -198,6 +253,13 @@ def parts():
         "leg_fl": ...,
         "backrest": ...,
     }
+
+def joints():
+    return [
+        {"type": "fixed", "parent": "seat", "child": "leg_fl"},
+        {"type": "fixed", "parent": "seat", "child": "backrest"},
+        # revolute / prismatic only when that motion is part of the product
+    ]
 
 def build():
     solid = None

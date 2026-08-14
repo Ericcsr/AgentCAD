@@ -12,6 +12,7 @@ import cadquery as cq
 import math
 import numpy as np
 
+from cad_pipeline.joints import JointSpec, parse_joints, validate_joints
 from cad_pipeline.mesh_utils import solid_to_mesh
 from cad_pipeline.step_import import load_reference_solid
 
@@ -35,6 +36,7 @@ class DesignResult:
     vertices: np.ndarray
     faces: np.ndarray
     parts: dict[str, PartSpec] = field(default_factory=dict)
+    joints: list[JointSpec] = field(default_factory=list)
 
     def part_names(self) -> list[str]:
         return list(self.parts.keys())
@@ -111,6 +113,7 @@ def run_design_code(code: str) -> DesignResult:
       - build() -> Workplane                     (single body; part name "body")
       - build() -> dict[str, Workplane]          (named parts; assembly = union)
       - parts() -> dict[str, Workplane] + build() -> assembly Workplane
+      - joints() -> list of {type, parent, child, ...}  (optional for 1 part)
     """
     cleaned = _extract_code(code)
     safe_builtins = {
@@ -204,12 +207,37 @@ def run_design_code(code: str) -> DesignResult:
         raise RuntimeError(f"Tessellation failed:\n{exc}\n\n{traceback.format_exc()}") from exc
 
     parts = _tessellate_parts(part_solids)
+    joints_fn = namespace.get("joints")
+    if callable(joints_fn):
+        try:
+            raw_joints = joints_fn()
+        except Exception as exc:
+            raise RuntimeError(f"joints() raised:\n{exc}\n\n{traceback.format_exc()}") from exc
+        try:
+            joints = parse_joints(raw_joints)
+        except ValueError as exc:
+            raise RuntimeError(f"joints() is invalid:\n{exc}") from exc
+    elif len(part_solids) >= 2:
+        raise RuntimeError(
+            "Multi-part designs must define joints() so the URDF can describe "
+            "how parts relate.\n"
+            "Return a list of dicts: {type, parent, child} with optional "
+            "axis/origin/lower/upper.\n"
+            "type is fixed | revolute | prismatic | continuous.\n"
+            "Use fixed only when parts are actually fastened. Use revolute or "
+            "prismatic when that DOF is part of the product function.\n"
+            "Do NOT weld unrelated parts. An empty list is OK if nothing is connected."
+        )
+    else:
+        joints = []
+    validate_joints(joints, list(part_solids.keys()))
     return DesignResult(
         code=cleaned,
         solid=assembly,
         vertices=vertices,
         faces=faces,
         parts=parts,
+        joints=joints,
     )
 
 

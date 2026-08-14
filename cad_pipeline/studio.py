@@ -13,6 +13,7 @@ from typing import Callable
 from cad_pipeline.agent import DesignAgent, _HEARTBEAT_PREFIX
 from cad_pipeline.mesh_utils import geometry_summary, mesh_bbox_summary
 from cad_pipeline.render import RENDER_DIR
+from cad_pipeline.joints import format_joints_block
 from cad_pipeline.runtime import (
     WHOLE_DESIGN,
     DesignResult,
@@ -22,6 +23,7 @@ from cad_pipeline.runtime import (
     export_stl,
     save_design_script,
 )
+from cad_pipeline.urdf import export_urdf
 from cad_pipeline.ui_dialogs import ask_open_step_paths, ask_save_name
 from cad_pipeline.ui_scale import (
     apply_scaling,
@@ -117,12 +119,13 @@ class DesignStudio:
                 "Parts: " + ", ".join(self.result.part_names())
                 + " — use View to isolate a part; Edit scope to target Agent revisions."
             )
+            self._log_system(format_joints_block(self.result.joints, self.result.part_names()))
         self._log_system(
             "Design ready. Drag in the 3D view to orbit · scroll to zoom · "
             "Agent revises · Ask answers · Ctrl+S saves.\n"
             f"Mode: {self.agent.mode_label()} — "
             + (
-                "stops once CAD builds and renders (fast iteration)."
+                "stops once CAD builds, renders, parts do not collide, and welds touch."
                 if self.agent.is_draft_mode()
                 else "checks every key feature / physics constraint after each build."
             )
@@ -281,6 +284,9 @@ class DesignStudio:
             side=tk.LEFT, padx=(scaled(self.root, 6), 0)
         )
         ttk.Button(view_row, text="ZIP all STLs", command=self._on_export_all_stl_zip).pack(
+            side=tk.LEFT, padx=(scaled(self.root, 6), 0)
+        )
+        ttk.Button(view_row, text="Export URDF", command=self._on_export_urdf).pack(
             side=tk.LEFT, padx=(scaled(self.root, 6), 0)
         )
         self.import_step_btn = ttk.Button(
@@ -486,7 +492,7 @@ class DesignStudio:
         if self.agent.is_draft_mode():
             self._log_system(
                 "Mode → Drafting: Agent stops once CAD compiles and renders "
-                "(no feature / physics review loop)."
+                "(collision + weld-contact still run; no feature / physics review loop)."
             )
         else:
             self._log_system(
@@ -569,7 +575,8 @@ class DesignStudio:
         block = (
             f"Viewing: {self._scope_label(self.view_scope)}\n"
             f"Parts: {names}\n"
-            f"{base}"
+            f"{base}\n"
+            f"{format_joints_block(self.result.joints, self.result.part_names())}"
         )
         refs = self.agent.references
         if refs:
@@ -787,6 +794,9 @@ class DesignStudio:
                 )
                 if new_result.part_names():
                     self._log_system("Parts: " + ", ".join(new_result.part_names()))
+                    self._log_system(
+                        format_joints_block(new_result.joints, new_result.part_names())
+                    )
                 if self.agent.features:
                     self._log_system(self.agent.features_summary())
                 self._commit_version(
@@ -987,6 +997,9 @@ class DesignStudio:
                 )
                 if restored.part_names():
                     self._log_system("Parts: " + ", ".join(restored.part_names()))
+                    self._log_system(
+                        format_joints_block(restored.joints, restored.part_names())
+                    )
                 if self.agent.features:
                     self._log_system(self.agent.features_summary())
                 self._refresh_version_ui(select_id=version_id)
@@ -1108,6 +1121,37 @@ class DesignStudio:
             listing = "\n".join(p.name for p in paths)
             self._log_system(f"Exported {len(paths)} part STEP file(s)")
             messagebox.showinfo("Exported parts", f"Wrote:\n{listing}", parent=self.root)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Export failed", str(exc), parent=self.root)
+
+    def _on_export_urdf(self) -> None:
+        if self._busy or self._closed:
+            return
+        if not self.result.part_names():
+            messagebox.showinfo("Export URDF", "No named parts in this design.", parent=self.root)
+            return
+        path = ask_save_name(
+            self.root,
+            self.models_dir,
+            title="Export URDF",
+            prompt="Enter a name for the URDF package (without path):",
+            initialvalue="design.urdf",
+            extensions=(".urdf",),
+            default_ext=".urdf",
+        )
+        if path is None:
+            return
+        try:
+            package, urdf_path, meshes = export_urdf(self.result, path)
+            listing = "\n".join(p.name for p in meshes)
+            kin = format_joints_block(self.result.joints, self.result.part_names())
+            self._log_system(f"Exported URDF → {urdf_path}\n{kin}")
+            messagebox.showinfo(
+                "Exported URDF",
+                f"Wrote package:\n{package}\n\n{urdf_path.name}\n\n"
+                f"{kin}\n\nMeshes:\n{listing}",
+                parent=self.root,
+            )
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Export failed", str(exc), parent=self.root)
 
