@@ -24,7 +24,8 @@ Optional env (.env supported):
   DESIGN_MODEL           default grok-4.5 (aliases: grok-4.6, claude, openai, …)
   DESIGN_LLM             auto|cursor|mock  (auto → cursor if key present)
   DESIGN_FAST            1/true to enable Cursor model fast mode
-  DESIGN_MODE            draft|refine (default draft — skip constraint review)
+  DESIGN_MODE            draft|refine (default draft — studio revisions skip review;
+                         the initial design always runs feature/physics review)
   DESIGN_DEBUG_RETRIES   build→debug cycles on CadQuery errors (default 5)
   DESIGN_REVIEW_ROUNDS   inspect→refine cycles after a successful build (default 3)
 """
@@ -166,6 +167,7 @@ def run_pipeline(*, fast: bool | None = None, model: str | None = None) -> int:
                 code,
                 requirements=prompt,
                 on_status=_progress_status,
+                review=True,
             )
             holder["result"] = result
         except Exception as exc:  # noqa: BLE001 — surfaced in UI

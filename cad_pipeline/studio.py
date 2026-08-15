@@ -14,6 +14,7 @@ from cad_pipeline.agent import DesignAgent, _HEARTBEAT_PREFIX
 from cad_pipeline.mesh_utils import geometry_summary, mesh_bbox_summary
 from cad_pipeline.render import RENDER_DIR
 from cad_pipeline.joints import format_joints_block
+from cad_pipeline.part_colors import DEFAULT_PART_COLOR, assign_part_colors
 from cad_pipeline.runtime import (
     WHOLE_DESIGN,
     DesignResult,
@@ -108,7 +109,7 @@ class DesignStudio:
             min_height=min_h,
         )
 
-        self.preview.set_mesh(initial.vertices, initial.faces, reset_camera=True)
+        self._show_preview(reset_camera=True)
         self.agent.set_mesh(initial.vertices, initial.faces)
         # One OpenGL context only — agent renders go through the preview on the UI thread
         self.agent.set_host_renderer(self.preview.render_view)
@@ -125,7 +126,7 @@ class DesignStudio:
             "Agent revises · Ask answers · Ctrl+S saves.\n"
             f"Mode: {self.agent.mode_label()} — "
             + (
-                "stops once CAD builds, renders, parts do not collide, and welds touch."
+                "studio revisions stop at a compilable solid (initial design was reviewed)."
                 if self.agent.is_draft_mode()
                 else "checks every key feature / physics constraint after each build."
             )
@@ -491,8 +492,9 @@ class DesignStudio:
         self.agent.set_design_mode(mode)
         if self.agent.is_draft_mode():
             self._log_system(
-                "Mode → Drafting: Agent stops once CAD compiles and renders "
-                "(collision + weld-contact still run; no feature / physics review loop)."
+                "Mode → Drafting: studio revisions stop once CAD compiles and renders "
+                "(collision + weld-contact + assembly still run; no feature / physics "
+                "review loop). The initial design was already reviewed."
             )
         else:
             self._log_system(
@@ -545,15 +547,14 @@ class DesignStudio:
 
     def _apply_result(self, result: DesignResult, *, reset_camera: bool) -> None:
         self.result = result
-        verts, faces = result.mesh_for(self.view_scope)
         self.agent.set_mesh(result.vertices, result.faces)
-        self._set_mesh(verts, faces, reset_camera=reset_camera)
+        self._show_preview(reset_camera=reset_camera)
         self._refresh_parts_ui()
 
     def _on_view_scope_changed(self, _event: object | None = None) -> None:
         self.view_scope = self._scope_from_label(self.view_scope_var.get())
-        verts, faces = self.result.mesh_for(self.view_scope)
-        self._set_mesh(verts, faces, reset_camera=True)
+        self._show_preview(reset_camera=True)
+        verts, _faces = self.result.mesh_for(self.view_scope)
         label = self._scope_label(self.view_scope)
         self._log_system(f"Viewing · {label}\n{mesh_bbox_summary(verts)}")
 
@@ -563,6 +564,25 @@ class DesignStudio:
 
     def _set_mesh(self, vertices, faces, *, reset_camera: bool) -> None:
         self.preview.set_mesh(vertices, faces, reset_camera=reset_camera)
+
+    def _show_preview(self, *, reset_camera: bool) -> None:
+        """Whole design: one actor per part, contact-graph coloring. Isolated part: one mesh."""
+        result = self.result
+        colors = assign_part_colors(result) if result and result.parts else {}
+        if (
+            self.view_scope == WHOLE_DESIGN
+            and result is not None
+            and len(result.parts) >= 2
+        ):
+            meshes = [
+                (part.vertices, part.faces, colors.get(name, DEFAULT_PART_COLOR))
+                for name, part in result.parts.items()
+            ]
+            self.preview.set_part_meshes(meshes, reset_camera=reset_camera)
+            return
+        verts, faces = result.mesh_for(self.view_scope)
+        color = colors.get(self.view_scope) if self.view_scope != WHOLE_DESIGN else DEFAULT_PART_COLOR
+        self.preview.set_mesh(verts, faces, reset_camera=reset_camera, color=color)
 
     def _refresh_reference_overlay(self, *, reset_camera: bool = False) -> None:
         meshes = [(ref.vertices, ref.faces) for ref in self.agent.references]

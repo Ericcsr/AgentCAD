@@ -14,7 +14,7 @@ Describe a product in plain English. AgentCAD writes parametric CadQuery, builds
 | **Studio** | Orbit/zoom 3D preview + Agent / Ask chat |
 | **Parts** | Named parts — view, export, or edit one at a time |
 | **STEP import** | Load existing STEP as agent constraints (bbox, holes, topology) |
-| **Drafting vs refinement** | Fast “builds & renders” loop, or full feature/physics review |
+| **Drafting vs refinement** | Initial design is always reviewed; studio edits can skip review (draft) or keep reviewing (refine) |
 | **Version history** | Snapshot each change; rollback design + chat (**Ctrl+Z**) |
 | **Self-repair** | CadQuery errors fed back to the agent until build succeeds |
 | **Crash recovery** | Context worksheet + new agent resume after API / context failures |
@@ -73,7 +73,7 @@ python start_design.py
 
 ![AI CAD Studio — 3D preview on the left, Agent/Ask chat on the right](docs/images/studio.png)
 
-Orbit the solid on the left. Revise in **Agent**, inspect dimensions in **Ask**, switch **Drafting / Refinement**, and roll back from **History**.
+Orbit the solid on the left. Named parts in the whole-design view use contrasting colors so contacting pieces are easy to tell apart. Revise in **Agent**, inspect dimensions in **Ask**, switch **Drafting / Refinement**, and roll back from **History**.
 
 ### Example designs
 
@@ -129,21 +129,22 @@ DESIGN_LLM=mock python start_design.py   # offline demo, no API key
 
 ### Modes (header)
 
-- **Drafting** (default) — stop once the design compiles, renders, parts do not collide, and welded pairs touch. Fast iteration.
-- **Refinement** — after each build, check key features + physics; refine until pass or budget ends.
+- **Drafting** (default) — the **initial** design still runs the multi-round feature / physics review. After the studio opens, Agent revisions stop once the design compiles, renders, and passes collision / weld / assembly checks. Fast iteration.
+- **Refinement** — after every studio build, check key features + physics; refine until pass or budget ends.
 
 After every successful build with two or more named parts, compile-time feasibility runs:
 
 - **Collision** — overlapping volume between named parts is a failure (face contact is OK)
 - **Weld contact** — each `fixed` joint must be in contact. Unrelated parts, or parts that are not *directly* welded, may float
+- **Assembly** — closed loops must not thread each other (chain links), and a ring must not sit on a shaft / H-beam whose profile is larger than the hole at *both* ends. Open a gap in the ring, or keep one end smaller than the opening. A pin that can slide off one end is OK.
 
-Either failure is treated like a compile error and the agent is asked to rebuild.
+Any of these failures is treated like a compile error and the agent is asked to rebuild.
 
 ### Parts
 
 Designs should expose named parts via `parts()` (assembly in `build()`).
 
-- **View** — isolate a part in the 3D preview  
+- **View** — isolate a part in the 3D preview. Whole design colors contacting parts differently.  
 - **Export part STEP** / **Export all STEP** — separate STEP files  
 - **Export part STL** — single-part triangle mesh  
 - **ZIP all STLs** — folder of part meshes + a `.zip` under `models/`  
@@ -200,11 +201,11 @@ Copy from `.env.example`. Common variables:
 | `CURSOR_API_KEY` | — | Cursor Integrations API key |
 | `DESIGN_MODEL` | `grok-4.5` | Cursor SDK model id or alias (`grok-4.6`, `claude`, `openai`, …). CLI `--model` overrides |
 | `DESIGN_LLM` | `auto` | `auto` \| `cursor` \| `mock` |
-| `DESIGN_MODE` | `draft` | `draft` \| `refine` |
+| `DESIGN_MODE` | `draft` | `draft` (studio revisions skip review) \| `refine` (review every build). Initial design always reviews. |
 | `DESIGN_FAST` | off | `1` / `true` → model `fast=true` |
 | `DESIGN_DEBUG_RETRIES` | `5` | Build → debug / collision-fix cycles |
-| `DESIGN_COLLISION` | on | `0` / `false` to skip compile-time collision + weld-contact checks |
-| `DESIGN_REVIEW_ROUNDS` | `3` | Review → refine rounds (refine mode) |
+| `DESIGN_COLLISION` | on | `0` / `false` to skip compile-time collision, weld-contact, and assembly checks |
+| `DESIGN_REVIEW_ROUNDS` | `3` | Review → refine rounds (initial design, and every studio build in refine mode) |
 | `DESIGN_AGENT_RECOVERIES` | `3` | Worksheet relaunches per failed send |
 | `DESIGN_UI_SCALE` | auto | Override HiDPI UI scale (e.g. `2.0`) |
 

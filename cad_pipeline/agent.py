@@ -26,6 +26,7 @@ from cad_pipeline.context_worksheet import (
 from cad_pipeline.mesh_utils import geometry_summary
 from cad_pipeline.models import DEFAULT_MODEL, resolve_model
 from cad_pipeline.render import RENDER_DIR, MeshRenderer, list_views
+from cad_pipeline.assembly import assembly_notes
 from cad_pipeline.collision import (
     assert_compile_feasibility,
     collision_notes,
@@ -50,8 +51,8 @@ DEFAULT_VIEWS = ("isometric", "front", "side")
 REVIEW_VIEWS = ("isometric", "front", "side", "top", "back")
 
 # Pipeline quality modes
-MODE_DRAFT = "draft"  # compile + tessellate only — fast iteration
-MODE_REFINE = "refine"  # full feature / physics review loop
+MODE_DRAFT = "draft"  # studio revisions: compile + feasibility only
+MODE_REFINE = "refine"  # full feature / physics review after every build
 
 
 @dataclass
@@ -342,6 +343,7 @@ def heuristic_physics_notes(result: DesignResult) -> list[str]:
         notes.append("WARNING: extremely thin aspect ratio — possible paper-thin feature.")
     notes.extend(collision_notes(result))
     notes.extend(weld_contact_notes(result))
+    notes.extend(assembly_notes(result))
     notes.append(format_joints_block(result.joints, result.part_names()))
     return notes
 
@@ -385,6 +387,13 @@ Parts:
 - A fixed/weld joint is only valid if those two parts are in contact. A weld
   between parts that float apart is a compile failure. Unrelated parts, or parts
   that are not directly welded, may float.
+- Closed loops that thread each other (chain links, two connected rings) cannot
+  be assembled from rigid parts and will be rejected. Leave a gap in one loop
+  (split ring / hook), or keep only one part closed. A pin through a single hole
+  is OK.
+- A closed ring on a shaft, H-beam, or dogbone is infeasible if both ends are
+  larger than the hole (cannot slide on from either end). Leave a gap in the
+  ring, or keep one end smaller than the opening.
 - When a revision is scoped to ONE part, change only that part's geometry; keep other
   parts' names and interfaces stable unless the user asks otherwise.
 
@@ -421,6 +430,10 @@ Hard requirements:
   that fixed joint. Do not weld parts that do not touch.
 - If the error is about joints(), add or fix joints() only for parts that are
   actually related. Do not weld unrelated parts.
+- If the error is interlocking closed loops, open a gap in one ring (split /
+  hook) or do not thread two closed parts through each other.
+- If the error is a captive ring (both ends of a shaft / H-beam blocked), open
+  a gap in the ring or make one end smaller than the hole.
 - Do NOT use Vector.rotate — use Workplane.rotate(axisStart, axisEnd, angleDegrees).
 - After writing the fixed file, reply with a one-line confirmation.
 """
@@ -454,6 +467,8 @@ Check all of the following:
    - Parts that should touch should not have large unintended gaps
    - Named parts must not interpenetrate (collision check is also run geometrically)
    - Each fixed/weld joint must be in contact; floating welds fail compilation
+   - Closed loops must not thread each other; a ring must not be captive on a
+     shaft / H-beam that is oversized at both ends
 
 Output format — EXACTLY like this (no markdown fences):
 FEATURES_CHECK:
@@ -960,7 +975,7 @@ class DesignAgent:
     backend: str = field(default_factory=lambda: os.getenv("DESIGN_LLM", "auto"))
     # None → read DESIGN_FAST from env after dotenv loads
     fast: bool | None = None
-    # draft = build/render only; refine = full constraint review
+    # draft = studio revisions skip review; refine = review after every build
     design_mode: str | None = None
     worksheet: ContextWorksheet = field(default_factory=ContextWorksheet)
     references: list[StepReference] = field(default_factory=list)
@@ -972,6 +987,8 @@ class DesignAgent:
     _host_render: object | None = field(default=None, init=False, repr=False)
     _ui_marshal: object | None = field(default=None, init=False, repr=False)
     _status_hook: Callable[[str], None] | None = field(default=None, init=False, repr=False)
+    # First successful generate/finalize always reviews, even in drafting mode.
+    _initial_review_pending: bool = field(default=True, init=False, repr=False)
 
     def __post_init__(self) -> None:
         load_dotenv(ROOT / ".env")
@@ -1280,13 +1297,16 @@ class DesignAgent:
         replace=True  → initial brief (replace list)
         replace=False → revision / added detail (merge into existing)
 
-        Drafting mode always uses local heuristics (no extra Cursor round-trip).
+        Initial briefs use the model (needed for the first review). Drafting-mode
+        studio revisions use local heuristics (no extra Cursor round-trip).
         """
         text = (requirement or "").strip()
         if not text:
             return list(self.features)
 
-        use_heuristic = self.backend == "mock" or self.is_draft_mode()
+        use_heuristic = self.backend == "mock" or (
+            self.is_draft_mode() and not replace and not self._initial_review_pending
+        )
         if use_heuristic:
             incoming = heuristic_features_from_prompt(text)
             if replace or not self.features:
@@ -1789,6 +1809,7 @@ class DesignAgent:
 
     def generate(self, prompt: str) -> str:
         """Create an initial design from a natural-language brief."""
+        self._initial_review_pending = True
         self._trace("Generate · starting initial design")
         self.history = [{"role": "user", "content": prompt}]
         req = prompt.strip()
@@ -1940,7 +1961,9 @@ class DesignAgent:
             try:
                 result = run_design_code(current)
                 if _env_flag("DESIGN_COLLISION", True) and len(result.parts) >= 2:
-                    status(f"Feasibility · collision + weld contact ({len(result.parts)} parts)…")
+                    status(
+                        f"Feasibility · collision + weld + assembly ({len(result.parts)} parts)…"
+                    )
                     assert_compile_feasibility(result)
                     status(f"Feasibility · PASS ({len(result.parts)} parts)")
                 self.current_code = result.code
@@ -2009,11 +2032,12 @@ class DesignAgent:
         max_build_attempts: int | None = None,
         max_review_rounds: int | None = None,
         on_status: Callable[[str], None] | None = None,
+        review: bool | None = None,
     ) -> DesignResult:
         """
-        Build (with compile/runtime repair). In drafting mode, stop once the solid
-        tessellates. In refinement mode, inspect source + multi-view renders and
-        enforce the feature checklist / physics until PASS or review budget ends.
+        Build (with compile/runtime repair), then optionally run feature/physics
+        review. The initial design always reviews. After that, drafting mode
+        stops at a compilable solid; refinement mode reviews every studio build.
         """
         status = on_status or (lambda _s: None)
         self._status_hook = status
@@ -2026,11 +2050,20 @@ class DesignAgent:
             rounds = int(os.getenv("DESIGN_REVIEW_ROUNDS", "3"))
         rounds = max(1, rounds)
 
+        if review is None:
+            run_review = self.is_refine_mode() or self._initial_review_pending
+        else:
+            run_review = review
+
         mode = self.design_mode or MODE_DRAFT
+        phase_note = (
+            f"finalize in {mode} mode"
+            + (" (initial review)" if self._initial_review_pending and run_review else "")
+        )
         self.update_worksheet(
             phase="finalize_build",
             task_instruction=req or "Finalize current design",
-            notes=f"finalize in {mode} mode",
+            notes=phase_note,
         )
 
         try:
@@ -2043,13 +2076,17 @@ class DesignAgent:
             # Prove renderability with a quick mesh bind (tessellation already done)
             self.set_mesh(result.vertices, result.faces)
 
-            if self.is_draft_mode():
+            if not run_review:
                 status("Drafting mode — build + feasibility OK, skipping feature review.")
                 if not self.features and req:
                     self.sync_features(req, replace=True)
+                self._initial_review_pending = False
                 self.update_worksheet(phase="draft_ready", task_instruction=req)
                 status("Draft ready (compilable + renderable).")
                 return result
+
+            if self._initial_review_pending:
+                status("Initial design — running feature / physics review…")
 
             if not self.features and req:
                 status("Extracting key features from requirements…")
@@ -2091,11 +2128,13 @@ class DesignAgent:
                 if review.passed:
                     status("Design accepted after inspection.")
                     self.update_worksheet(phase="accepted", task_instruction=req)
+                    self._initial_review_pending = False
                     return result
 
                 if round_i >= rounds:
                     status("Review budget exhausted — returning best-effort design.")
                     self.update_worksheet(phase="review_budget_exhausted", task_instruction=req)
+                    self._initial_review_pending = False
                     return result
 
                 status(f"Refining from review feedback (round {round_i}/{rounds})…")
@@ -2116,6 +2155,7 @@ class DesignAgent:
                     on_status=on_status,
                 )
 
+            self._initial_review_pending = False
             return result
         finally:
             self._status_hook = None
@@ -2204,15 +2244,24 @@ class DesignAgent:
         hard = [n for n in physics if n.startswith("WARNING")]
         collision_fail = any("Collision check FAIL" in n for n in physics)
         weld_fail = any("Weld contact FAIL" in n for n in physics)
+        assembly_fail = any("Assembly check FAIL" in n for n in physics)
         # Geometric feasibility always fails review, even if the model said PASS.
         if outcome.passed and (
-            collision_fail or weld_fail or (hard and "PASS" not in (raw or "").upper())
+            collision_fail
+            or weld_fail
+            or assembly_fail
+            or (hard and "PASS" not in (raw or "").upper())
         ):
             if collision_fail:
                 default_actions = ["Separate overlapping named parts so they only meet at faces."]
             elif weld_fail:
                 default_actions = [
                     "Bring each welded pair into contact, or drop the floating fixed joint."
+                ]
+            elif assembly_fail:
+                default_actions = [
+                    "Open a gap in a closed loop, or make one end of a captive "
+                    "shaft / H-beam smaller than the ring so it can slide on."
                 ]
             else:
                 default_actions = ["Resolve the geometric warnings listed above."]

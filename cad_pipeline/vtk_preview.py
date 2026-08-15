@@ -75,33 +75,104 @@ class VtkPreview(tk.Frame):
         self.renderer.AddActor(self.actor)
         self._ref_actors: list[vtk.vtkActor] = []
         self._ref_bounds: list[tuple[np.ndarray, np.ndarray]] = []
+        self._part_actors: list[vtk.vtkActor] = []
+        self._part_bounds: list[tuple[np.ndarray, np.ndarray]] = []
 
     def _save_key(self) -> str:
         if self.on_key_save:
             self.on_key_save()
         return "break"
 
-    def set_mesh(self, vertices: np.ndarray, faces: np.ndarray, *, reset_camera: bool) -> None:
-        with VTK_LOCK:
-            points = vtk.vtkPoints()
-            points.SetData(numpy_to_vtk(np.asarray(vertices, dtype=np.float64), deep=True))
-            faces_arr = np.asarray(faces, dtype=np.int64)
-            cells = np.empty((len(faces_arr), 4), dtype=np.int64)
-            cells[:, 0] = 3
-            cells[:, 1:] = faces_arr
-            cell_array = vtk.vtkCellArray()
-            cell_array.ImportLegacyFormat(numpy_to_vtkIdTypeArray(cells.ravel(), deep=True))
-            poly = vtk.vtkPolyData()
-            poly.SetPoints(points)
-            poly.SetPolys(cell_array)
-            normals = vtk.vtkPolyDataNormals()
-            normals.SetInputData(poly)
-            normals.ComputePointNormalsOn()
-            normals.Update()
-            self.mapper.SetInputData(normals.GetOutput())
+    def _polydata(self, vertices: np.ndarray, faces: np.ndarray) -> vtk.vtkPolyData:
+        points = vtk.vtkPoints()
+        points.SetData(numpy_to_vtk(np.asarray(vertices, dtype=np.float64), deep=True))
+        faces_arr = np.asarray(faces, dtype=np.int64)
+        cells = np.empty((len(faces_arr), 4), dtype=np.int64)
+        cells[:, 0] = 3
+        cells[:, 1:] = faces_arr
+        cell_array = vtk.vtkCellArray()
+        cell_array.ImportLegacyFormat(numpy_to_vtkIdTypeArray(cells.ravel(), deep=True))
+        poly = vtk.vtkPolyData()
+        poly.SetPoints(points)
+        poly.SetPolys(cell_array)
+        normals = vtk.vtkPolyDataNormals()
+        normals.SetInputData(poly)
+        normals.ComputePointNormalsOn()
+        normals.Update()
+        return normals.GetOutput()
 
+    def _style_actor(self, actor: vtk.vtkActor, color: tuple[float, float, float]) -> None:
+        prop = actor.GetProperty()
+        prop.SetColor(*color)
+        prop.SetSpecular(0.22)
+        prop.SetSpecularPower(18)
+        prop.SetAmbient(0.32)
+        prop.SetDiffuse(0.78)
+        prop.EdgeVisibilityOn()
+        prop.SetEdgeColor(
+            max(0.0, color[0] * 0.45),
+            max(0.0, color[1] * 0.45),
+            max(0.0, color[2] * 0.45),
+        )
+        prop.SetLineWidth(1.0)
+
+    def _clear_part_actors(self) -> None:
+        for actor in self._part_actors:
+            self.renderer.RemoveActor(actor)
+        self._part_actors = []
+        self._part_bounds = []
+
+    def set_mesh(
+        self,
+        vertices: np.ndarray,
+        faces: np.ndarray,
+        *,
+        reset_camera: bool,
+        color: tuple[float, float, float] | None = None,
+    ) -> None:
+        rgb = color or (0.72, 0.58, 0.42)
+        with VTK_LOCK:
+            self._clear_part_actors()
+            self.mapper.SetInputData(self._polydata(vertices, faces))
+            self._style_actor(self.actor, rgb)
+            self.actor.SetVisibility(True)
             if reset_camera:
                 mins, maxs = self._combined_bounds(vertices)
+                self.center = 0.5 * (mins + maxs)
+                self._extent = float(max(np.linalg.norm(maxs - mins), 1.0))
+                self.distance = self._extent * 1.55
+                self.elev = 22.0
+                self.azim = -40.0
+        self.redraw(immediate=True)
+
+    def set_part_meshes(
+        self,
+        meshes: Iterable[tuple[np.ndarray, np.ndarray, tuple[float, float, float]]],
+        *,
+        reset_camera: bool = False,
+    ) -> None:
+        """Draw each named part as its own colored actor (whole-design view)."""
+        with VTK_LOCK:
+            self._clear_part_actors()
+            self.actor.SetVisibility(False)
+            all_pts: list[np.ndarray] = []
+            for vertices, faces, color in meshes:
+                verts = np.asarray(vertices, dtype=np.float64)
+                faces_arr = np.asarray(faces, dtype=np.int64)
+                if len(verts) == 0 or len(faces_arr) == 0:
+                    continue
+                mapper = vtk.vtkPolyDataMapper()
+                mapper.SetInputData(self._polydata(verts, faces_arr))
+                actor = vtk.vtkActor()
+                actor.SetMapper(mapper)
+                self._style_actor(actor, color)
+                self.renderer.AddActor(actor)
+                self._part_actors.append(actor)
+                self._part_bounds.append((verts.min(axis=0), verts.max(axis=0)))
+                all_pts.append(verts)
+            if reset_camera and all_pts:
+                stacked = np.concatenate(all_pts, axis=0)
+                mins, maxs = self._combined_bounds(stacked)
                 self.center = 0.5 * (mins + maxs)
                 self._extent = float(max(np.linalg.norm(maxs - mins), 1.0))
                 self.distance = self._extent * 1.55
@@ -170,6 +241,9 @@ class VtkPreview(tk.Frame):
     def _combined_bounds(self, vertices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         mins = np.asarray(vertices, dtype=np.float64).min(axis=0)
         maxs = np.asarray(vertices, dtype=np.float64).max(axis=0)
+        for bmin, bmax in self._part_bounds:
+            mins = np.minimum(mins, bmin)
+            maxs = np.maximum(maxs, bmax)
         for bmin, bmax in self._ref_bounds:
             mins = np.minimum(mins, bmin)
             maxs = np.maximum(maxs, bmax)

@@ -268,9 +268,12 @@ def weld_contact_notes(result: Any) -> list[str]:
 
 
 def assert_compile_feasibility(result: Any) -> None:
-    """Compilation checks: no interpenetration, and every weld is in contact."""
+    """Compilation checks: no overlap, welds in contact, no interlocking rings."""
+    from cad_pipeline.assembly import assert_assembly_feasible
+
     assert_no_part_collisions(result)
     assert_welded_parts_in_contact(result)
+    assert_assembly_feasible(result)
 
 
 def collision_notes(result: Any) -> list[str]:
