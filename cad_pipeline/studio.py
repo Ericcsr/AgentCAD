@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 import tkinter as tk
@@ -25,6 +26,7 @@ from cad_pipeline.runtime import (
     save_design_script,
 )
 from cad_pipeline.urdf import export_urdf
+from cad_pipeline.kinematics import forward_kinematics, joint_limits, moving_joints
 from cad_pipeline.ui_dialogs import ask_open_step_paths, ask_save_name
 from cad_pipeline.ui_scale import (
     apply_scaling,
@@ -62,6 +64,9 @@ class DesignStudio:
         self.mode = MODE_AGENT
         self.view_scope = WHOLE_DESIGN
         self.edit_scope = WHOLE_DESIGN
+        self.urdf_preview = False
+        self._joint_values: dict[str, float] = {}
+        self._joint_syncing = False
         self._busy_t0 = 0.0
         self._busy_phase = ""
         self._busy_tick_id: str | None = None
@@ -256,6 +261,7 @@ class DesignStudio:
 
         left.columnconfigure(0, weight=1)
         left.rowconfigure(2, weight=1)
+        left.rowconfigure(3, weight=0)
 
         ttk.Label(left, text="3D preview · drag to orbit · scroll to zoom", style="Hint.TLabel").grid(
             row=0, column=0, sticky="w", pady=(0, scaled(self.root, 6))
@@ -290,6 +296,14 @@ class DesignStudio:
         ttk.Button(view_row, text="Export URDF", command=self._on_export_urdf).pack(
             side=tk.LEFT, padx=(scaled(self.root, 6), 0)
         )
+        self.urdf_preview_var = tk.BooleanVar(value=False)
+        self.urdf_preview_btn = ttk.Checkbutton(
+            view_row,
+            text="URDF preview",
+            variable=self.urdf_preview_var,
+            command=self._on_urdf_preview_toggle,
+        )
+        self.urdf_preview_btn.pack(side=tk.LEFT, padx=(scaled(self.root, 10), 0))
         self.import_step_btn = ttk.Button(
             view_row, text="Import reference", command=self._on_import_step
         )
@@ -303,6 +317,58 @@ class DesignStudio:
             on_key_save=lambda: self._on_save(),
         )
         self.preview.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+
+        self.joints_panel = ttk.LabelFrame(left, text="URDF joints")
+        self.joints_panel.grid(row=3, column=0, sticky="ew", pady=(scaled(self.root, 8), 0))
+        self.joints_panel.columnconfigure(0, weight=1)
+        joints_header = ttk.Frame(self.joints_panel)
+        joints_header.grid(row=0, column=0, sticky="ew", padx=scaled(self.root, 6), pady=(scaled(self.root, 4), 0))
+        ttk.Label(
+            joints_header,
+            text="Drag sliders or type a value. Motion is from the assembled pose.",
+            style="Hint.TLabel",
+        ).pack(side=tk.LEFT)
+        ttk.Button(joints_header, text="Reset", command=self._reset_joint_values).pack(side=tk.RIGHT)
+        joints_body = ttk.Frame(self.joints_panel)
+        joints_body.grid(row=1, column=0, sticky="nsew", padx=scaled(self.root, 4), pady=scaled(self.root, 4))
+        joints_body.columnconfigure(0, weight=1)
+        self._joints_canvas = tk.Canvas(
+            joints_body,
+            height=scaled(self.root, 168),
+            highlightthickness=0,
+            bd=0,
+            bg=c["surface"],
+        )
+        self._joints_scroll = ttk.Scrollbar(
+            joints_body, orient=tk.VERTICAL, command=self._joints_canvas.yview
+        )
+        self._joints_canvas.configure(yscrollcommand=self._joints_scroll.set)
+        self._joints_canvas.grid(row=0, column=0, sticky="nsew")
+        self._joints_scroll.grid(row=0, column=1, sticky="ns")
+        self._joints_inner = ttk.Frame(self._joints_canvas)
+        self._joints_inner_id = self._joints_canvas.create_window(
+            (0, 0), window=self._joints_inner, anchor="nw"
+        )
+        self._joints_inner.bind(
+            "<Configure>",
+            lambda _e: self._joints_canvas.configure(scrollregion=self._joints_canvas.bbox("all")),
+        )
+        self._joints_canvas.bind(
+            "<Configure>",
+            lambda e: self._joints_canvas.itemconfigure(self._joints_inner_id, width=e.width),
+        )
+
+        def _scroll_joints(event: tk.Event) -> str:
+            if getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
+                self._joints_canvas.yview_scroll(1, "units")
+            else:
+                self._joints_canvas.yview_scroll(-1, "units")
+            return "break"
+
+        self._joints_canvas.bind("<MouseWheel>", _scroll_joints)
+        self._joints_canvas.bind("<Button-4>", _scroll_joints)
+        self._joints_canvas.bind("<Button-5>", _scroll_joints)
+        self.joints_panel.grid_remove()
 
         # Right chat column
         right.columnconfigure(0, weight=1)
@@ -548,11 +614,21 @@ class DesignStudio:
     def _apply_result(self, result: DesignResult, *, reset_camera: bool) -> None:
         self.result = result
         self.agent.set_mesh(result.vertices, result.faces)
+        if self.urdf_preview:
+            names = {j.name for j in moving_joints(result)}
+            self._joint_values = {k: v for k, v in self._joint_values.items() if k in names}
+            self._rebuild_joint_panel()
         self._show_preview(reset_camera=reset_camera)
         self._refresh_parts_ui()
 
     def _on_view_scope_changed(self, _event: object | None = None) -> None:
         self.view_scope = self._scope_from_label(self.view_scope_var.get())
+        if self.urdf_preview and self.view_scope != WHOLE_DESIGN:
+            self.urdf_preview = False
+            self.urdf_preview_var.set(False)
+            self.joints_panel.grid_remove()
+            self.preview.set_part_transforms(None)
+            self._log_system("URDF preview off (part isolate).")
         self._show_preview(reset_camera=True)
         verts, _faces = self.result.mesh_for(self.view_scope)
         label = self._scope_label(self.view_scope)
@@ -567,22 +643,159 @@ class DesignStudio:
 
     def _show_preview(self, *, reset_camera: bool) -> None:
         """Whole design: one actor per part, contact-graph coloring. Isolated part: one mesh."""
+        if self.urdf_preview:
+            self.view_scope = WHOLE_DESIGN
+            if hasattr(self, "view_scope_var"):
+                self.view_scope_var.set("Whole design")
         result = self.result
         colors = assign_part_colors(result) if result and result.parts else {}
-        if (
-            self.view_scope == WHOLE_DESIGN
-            and result is not None
-            and len(result.parts) >= 2
-        ):
+        use_parts = bool(
+            result is not None
+            and result.parts
+            and (
+                self.urdf_preview
+                or (self.view_scope == WHOLE_DESIGN and len(result.parts) >= 2)
+            )
+        )
+        if use_parts:
             meshes = [
-                (part.vertices, part.faces, colors.get(name, DEFAULT_PART_COLOR))
+                (name, part.vertices, part.faces, colors.get(name, DEFAULT_PART_COLOR))
                 for name, part in result.parts.items()
             ]
             self.preview.set_part_meshes(meshes, reset_camera=reset_camera)
+            if self.urdf_preview:
+                self._apply_joint_poses()
             return
         verts, faces = result.mesh_for(self.view_scope)
         color = colors.get(self.view_scope) if self.view_scope != WHOLE_DESIGN else DEFAULT_PART_COLOR
         self.preview.set_mesh(verts, faces, reset_camera=reset_camera, color=color)
+
+    def _on_urdf_preview_toggle(self) -> None:
+        self.urdf_preview = bool(self.urdf_preview_var.get())
+        if self.urdf_preview:
+            if not moving_joints(self.result):
+                self._log_system(
+                    "URDF preview · no moving joints (fixed-only tree). Sliders stay empty."
+                )
+            self.view_scope = WHOLE_DESIGN
+            self.view_scope_var.set("Whole design")
+            self.joints_panel.grid()
+            self._rebuild_joint_panel()
+            self._show_preview(reset_camera=False)
+            self._log_system("URDF preview on — drag joint sliders or type values.")
+            return
+        self.joints_panel.grid_remove()
+        self.preview.set_part_transforms(None)
+        self._show_preview(reset_camera=False)
+        self._log_system("URDF preview off.")
+
+    def _rebuild_joint_panel(self) -> None:
+        for child in self._joints_inner.winfo_children():
+            child.destroy()
+        joints = moving_joints(self.result)
+        kept = {joint.name: float(self._joint_values.get(joint.name, 0.0)) for joint in joints}
+        self._joint_values = kept
+        if not joints:
+            ttk.Label(
+                self._joints_inner,
+                text="No revolute / prismatic / continuous joints in joints().",
+                style="Hint.TLabel",
+            ).pack(anchor="w", pady=scaled(self.root, 6))
+            return
+        for joint in joints:
+            self._add_joint_slider(joint)
+
+    def _add_joint_slider(self, joint) -> None:
+        lo_i, hi_i = joint_limits(joint)
+        prismatic = joint.type == "prismatic"
+        if prismatic:
+            lo_d, hi_d = lo_i, hi_i
+            unit = "mm"
+            to_internal = lambda value: float(value)
+            to_display = lambda value: float(value)
+        else:
+            lo_d, hi_d = math.degrees(lo_i), math.degrees(hi_i)
+            unit = "°"
+            to_internal = math.radians
+            to_display = math.degrees
+        fmt = "{:.1f}"
+        q = min(max(float(self._joint_values.get(joint.name, 0.0)), lo_i), hi_i)
+        self._joint_values[joint.name] = q
+        row = ttk.Frame(self._joints_inner)
+        row.pack(fill=tk.X, pady=scaled(self.root, 3))
+        ttk.Label(
+            row,
+            text=f"{joint.name}  {joint.parent} → {joint.child}  ({joint.type})",
+        ).pack(anchor="w")
+        ctrl = ttk.Frame(row)
+        ctrl.pack(fill=tk.X)
+        var = tk.DoubleVar(value=to_display(q))
+        scale = ttk.Scale(ctrl, from_=lo_d, to=hi_d, variable=var, orient=tk.HORIZONTAL)
+        scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, scaled(self.root, 8)))
+        entry = ttk.Entry(ctrl, width=8)
+        entry.insert(0, fmt.format(to_display(q)))
+        entry.pack(side=tk.LEFT)
+        ttk.Label(ctrl, text=unit, style="Hint.TLabel").pack(
+            side=tk.LEFT, padx=(scaled(self.root, 4), 0)
+        )
+
+        def on_scale(val: str, name: str = joint.name) -> None:
+            if self._joint_syncing:
+                return
+            try:
+                display = float(val)
+            except (TypeError, ValueError):
+                return
+            internal = min(max(float(to_internal(display)), lo_i), hi_i)
+            self._joint_values[name] = internal
+            self._joint_syncing = True
+            try:
+                entry.delete(0, tk.END)
+                entry.insert(0, fmt.format(to_display(internal)))
+            finally:
+                self._joint_syncing = False
+            self._apply_joint_poses()
+
+        def on_entry(_evt: object | None = None, name: str = joint.name) -> None:
+            if self._joint_syncing:
+                return
+            try:
+                raw = float(entry.get().strip())
+            except ValueError:
+                self._joint_syncing = True
+                try:
+                    current = float(self._joint_values.get(name, 0.0))
+                    entry.delete(0, tk.END)
+                    entry.insert(0, fmt.format(to_display(current)))
+                finally:
+                    self._joint_syncing = False
+                return
+            internal = min(max(float(to_internal(raw)), lo_i), hi_i)
+            display = to_display(internal)
+            self._joint_values[name] = internal
+            self._joint_syncing = True
+            try:
+                var.set(display)
+                entry.delete(0, tk.END)
+                entry.insert(0, fmt.format(display))
+            finally:
+                self._joint_syncing = False
+            self._apply_joint_poses()
+
+        scale.configure(command=on_scale)
+        entry.bind("<Return>", on_entry)
+        entry.bind("<FocusOut>", on_entry)
+
+    def _apply_joint_poses(self) -> None:
+        if not self.urdf_preview:
+            return
+        poses = forward_kinematics(self.result, self._joint_values)
+        self.preview.set_part_transforms(poses)
+
+    def _reset_joint_values(self) -> None:
+        self._joint_values = {joint.name: 0.0 for joint in moving_joints(self.result)}
+        self._rebuild_joint_panel()
+        self._apply_joint_poses()
 
     def _refresh_reference_overlay(self, *, reset_camera: bool = False) -> None:
         meshes = [(ref.vertices, ref.faces) for ref in self.agent.references]
@@ -720,6 +933,7 @@ class DesignStudio:
             getattr(self, "rollback_btn", None),
             getattr(self, "version_combo", None),
             getattr(self, "import_step_btn", None),
+            getattr(self, "urdf_preview_btn", None),
         ):
             if btn is not None:
                 try:

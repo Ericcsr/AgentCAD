@@ -77,6 +77,8 @@ class VtkPreview(tk.Frame):
         self._ref_bounds: list[tuple[np.ndarray, np.ndarray]] = []
         self._part_actors: list[vtk.vtkActor] = []
         self._part_bounds: list[tuple[np.ndarray, np.ndarray]] = []
+        self._part_actor_names: list[str] = []
+        self._part_actors_by_name: dict[str, vtk.vtkActor] = {}
 
     def _save_key(self) -> str:
         if self.on_key_save:
@@ -121,6 +123,8 @@ class VtkPreview(tk.Frame):
             self.renderer.RemoveActor(actor)
         self._part_actors = []
         self._part_bounds = []
+        self._part_actor_names = []
+        self._part_actors_by_name = {}
 
     def set_mesh(
         self,
@@ -147,16 +151,24 @@ class VtkPreview(tk.Frame):
 
     def set_part_meshes(
         self,
-        meshes: Iterable[tuple[np.ndarray, np.ndarray, tuple[float, float, float]]],
+        meshes: Iterable[
+            tuple[str, np.ndarray, np.ndarray, tuple[float, float, float]]
+            | tuple[np.ndarray, np.ndarray, tuple[float, float, float]]
+        ],
         *,
         reset_camera: bool = False,
     ) -> None:
-        """Draw each named part as its own colored actor (whole-design view)."""
+        """Draw each named part as its own colored actor (whole-design / URDF view)."""
         with VTK_LOCK:
             self._clear_part_actors()
             self.actor.SetVisibility(False)
             all_pts: list[np.ndarray] = []
-            for vertices, faces, color in meshes:
+            for item in meshes:
+                if len(item) == 4:
+                    name, vertices, faces, color = item
+                else:
+                    vertices, faces, color = item
+                    name = f"part_{len(self._part_actors)}"
                 verts = np.asarray(vertices, dtype=np.float64)
                 faces_arr = np.asarray(faces, dtype=np.int64)
                 if len(verts) == 0 or len(faces_arr) == 0:
@@ -168,6 +180,8 @@ class VtkPreview(tk.Frame):
                 self._style_actor(actor, color)
                 self.renderer.AddActor(actor)
                 self._part_actors.append(actor)
+                self._part_actor_names.append(str(name))
+                self._part_actors_by_name[str(name)] = actor
                 self._part_bounds.append((verts.min(axis=0), verts.max(axis=0)))
                 all_pts.append(verts)
             if reset_camera and all_pts:
@@ -179,6 +193,30 @@ class VtkPreview(tk.Frame):
                 self.elev = 22.0
                 self.azim = -40.0
         self.redraw(immediate=True)
+
+    def set_part_transforms(
+        self,
+        transforms: dict[str, np.ndarray] | None,
+        *,
+        redraw: bool = True,
+    ) -> None:
+        """Apply 4×4 world mm poses to named part actors (identity if omitted)."""
+        with VTK_LOCK:
+            for name, actor in self._part_actors_by_name.items():
+                mat = None if not transforms else transforms.get(name)
+                if mat is None:
+                    actor.SetUserTransform(None)
+                    continue
+                vtk_mat = vtk.vtkMatrix4x4()
+                arr = np.asarray(mat, dtype=np.float64)
+                for i in range(4):
+                    for j in range(4):
+                        vtk_mat.SetElement(i, j, float(arr[i, j]))
+                xf = vtk.vtkTransform()
+                xf.SetMatrix(vtk_mat)
+                actor.SetUserTransform(xf)
+        if redraw:
+            self.redraw(immediate=True)
 
     def set_reference_meshes(
         self,

@@ -149,6 +149,7 @@ Designs should expose named parts via `parts()` (assembly in `build()`).
 - **Export part STL** — single-part triangle mesh  
 - **ZIP all STLs** — folder of part meshes + a `.zip` under `models/`  
 - **Export URDF** — package folder with `*.urdf` + per-part STL meshes  
+- **URDF preview** — joint sliders under the 3D view. Drag or type values (degrees for revolute/continuous, mm for prismatic) to pose the assembly from the as-designed pose. **Reset** returns every joint to zero. Isolating a part turns this off. Fixed-only trees show an empty panel.  
 - **Import reference** — add STEP/STP, IGES, BREP, STL, OBJ, or PLY as agent context (ghost overlay)
 
 Multi-part designs must define `joints()`: a tree of `{type, parent, child}` relations for the URDF. Use `revolute` / `prismatic` when that motion is part of the product function. Use `fixed` only for parts that are actually fastened. Unrelated parts are left unwelded (separate roots).
@@ -237,6 +238,7 @@ AgentCAD/
 │   ├── agent.py             # Cursor/mock agent, review, recovery
 │   ├── runtime.py           # Execute CadQuery, parts, STEP export
 │   ├── joints.py            # joints() parse / URDF tree validation
+│   ├── kinematics.py        # Forward kinematics for URDF preview
 │   ├── urdf.py              # URDF + mesh package export
 │   ├── studio.py            # Tk + VTK interactive UI
 │   ├── versioning.py        # Design / chat snapshots

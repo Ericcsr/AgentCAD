@@ -10,11 +10,8 @@ from xml.sax.saxutils import escape
 
 import numpy as np
 
-from cad_pipeline.joints import (
-    JointSpec,
-    infer_origin_mm,
-    root_links,
-)
+from cad_pipeline.joints import root_links
+from cad_pipeline.kinematics import link_world_origins_mm
 from cad_pipeline.runtime import DesignResult, export_stl, _safe_part_filename
 
 MM_TO_M = 0.001
@@ -67,42 +64,7 @@ def _inertial_xml(part: Any, indent: str) -> str:
 
 
 def _link_world_origins_mm(result: DesignResult) -> dict[str, tuple[float, float, float]]:
-    """World-mm origin of each link frame (world-aligned). Roots stay at 0."""
-    names = result.part_names()
-    joints = list(result.joints)
-    world: dict[str, tuple[float, float, float]] = {
-        name: (0.0, 0.0, 0.0) for name in root_links(names, joints)
-    }
-    pending = list(joints)
-    guard = 0
-    while pending and guard < len(pending) + 2:
-        guard += 1
-        leftover: list[JointSpec] = []
-        for joint in pending:
-            if joint.parent not in world:
-                leftover.append(joint)
-                continue
-            parent_w = np.asarray(world[joint.parent], dtype=np.float64)
-            if joint.origin_mm is not None:
-                child_w = np.asarray(joint.origin_mm, dtype=np.float64)
-            elif joint.is_moving():
-                child_w = np.asarray(
-                    infer_origin_mm(
-                        result.parts[joint.parent].vertices,
-                        result.parts[joint.child].vertices,
-                    ),
-                    dtype=np.float64,
-                )
-            else:
-                # Fixed mate: keep the child in the parent frame (no invented weld offset).
-                child_w = parent_w
-            world[joint.child] = (float(child_w[0]), float(child_w[1]), float(child_w[2]))
-        if len(leftover) == len(pending):
-            break
-        pending = leftover
-    for name in names:
-        world.setdefault(name, (0.0, 0.0, 0.0))
-    return world
+    return link_world_origins_mm(result)
 
 
 def render_urdf_xml(
