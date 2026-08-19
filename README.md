@@ -13,7 +13,7 @@ Describe a product in plain English. AgentCAD writes parametric CadQuery, builds
 | **Agent design** | Cursor SDK writes `generated/current_design.py` (Grok / Claude / OpenAI / Composer) |
 | **Studio** | Orbit/zoom 3D preview + Agent / Ask chat |
 | **Parts** | Named parts — view, export, or edit one at a time |
-| **STEP import** | Load existing STEP as agent constraints (bbox, holes, topology) |
+| **Reference import** | Load STEP/STP, IGES, STL, OBJ, PLY as agent constraints (bbox, holes, topology) |
 | **Drafting vs refinement** | Initial design is always reviewed; studio edits can skip review (draft) or keep reviewing (refine) |
 | **Version history** | Snapshot each change; rollback design + chat (**Ctrl+Z**) |
 | **Self-repair** | CadQuery errors fed back to the agent until build succeeds |
@@ -149,22 +149,24 @@ Designs should expose named parts via `parts()` (assembly in `build()`).
 - **Export part STL** — single-part triangle mesh  
 - **ZIP all STLs** — folder of part meshes + a `.zip` under `models/`  
 - **Export URDF** — package folder with `*.urdf` + per-part STL meshes  
-- **Import STEP** — add an existing STEP as agent context (ghost overlay in the preview)
+- **Import reference** — add STEP/STP, IGES, BREP, STL, OBJ, or PLY as agent context (ghost overlay)
 
 Multi-part designs must define `joints()`: a tree of `{type, parent, child}` relations for the URDF. Use `revolute` / `prismatic` when that motion is part of the product function. Use `fixed` only for parts that are actually fastened. Unrelated parts are left unwelded (separate roots).
 
-### Imported STEP references
+### Imported CAD / mesh references
 
-Load a STEP **before the first prompt** (Load STEP… on the start dialog) or later with **Import STEP** in the studio.
+Load a reference **before the first prompt** (Load reference… on the start dialog) or later with **Import reference** in the studio.
+
+Accepted formats: **STEP/STP**, **IGES/IGS**, **BREP**, **STL**, **OBJ**, **ASCII PLY**.
 
 The agent does not only display the file. It:
 
-- Copies it to `generated/references/<name>.step` (kept out of the Cursor agent via `.cursorignore`)
-- Extracts bbox, volume, solid count, face types, and cylinder radii (holes/shafts)
+- Copies it to `generated/references/<name>.<ext>` (kept out of the Cursor agent via `.cursorignore`)
+- Extracts bbox, volume, solid count, face types, and cylinder radii (holes/shafts) when the file is B-rep
 - Writes `generated/references/<name>.md` and injects those facts into generate / revise / Ask / review
-- Can use the exact B-rep in CadQuery via `import_reference("name")` (injected at runtime)
+- Can use the exact shape in CadQuery via `import_reference("name")` (injected at runtime)
 
-The live design stays parametric CadQuery. The imported STEP is a constraint (mate, envelope, matching holes). A translucent overlay in the 3D view shows the reference next to the current design. The agent is told **not** to open the binary STEP — only the measured facts and `import_reference()`.
+The live design stays parametric CadQuery. The imported file is a constraint (mate, envelope, matching holes). A translucent overlay in the 3D view shows the reference next to the current design. The agent is told **not** to open the binary — only the measured facts and `import_reference()`.
 
 - **Edit scope** (Agent tab) — apply a revision to the whole design or one part  
 

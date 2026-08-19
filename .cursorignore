@@ -1,9 +1,30 @@
-# Binary CAD — the local Cursor agent must not ingest these.
+# Binary CAD / mesh — the local Cursor agent must not ingest these.
 # Measured facts live in generated/references/*.md; CadQuery uses import_reference().
 *.step
 *.stp
 *.STEP
 *.STP
+*.stl
+*.STL
+*.obj
+*.OBJ
+*.iges
+*.igs
+*.IGES
+*.IGS
+*.brep
+*.BREP
+*.ply
+*.PLY
 generated/references/*.step
+generated/references/*.stp
+generated/references/*.stl
+generated/references/*.obj
+generated/references/*.iges
+generated/references/*.igs
+generated/references/*.brep
+generated/references/*.ply
 models/*.step
 models/*.stp
+models/*.stl
+models/*.obj

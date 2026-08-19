@@ -140,7 +140,7 @@ def run_pipeline(*, fast: bool | None = None, model: str | None = None) -> int:
         flush=True,
     )
     if step_paths:
-        print("STEP references:", ", ".join(p.name for p in step_paths), flush=True)
+        print("References:", ", ".join(p.name for p in step_paths), flush=True)
 
     set_message, close_progress = _show_progress(root, "Generating initial design…")
     # VTK OpenGL must run on the Tk thread — marshal agent renders here until Studio takes over

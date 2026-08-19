@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tk dialogs: initial language prompt, STEP import, and save name."""
+"""Tk dialogs: initial language prompt, reference import, and save name."""
 
 from __future__ import annotations
 
@@ -21,15 +21,24 @@ def ask_open_step_paths(
     parent: tk.Misc,
     *,
     initialdir: Path | None = None,
-    title: str = "Import STEP model",
+    title: str = "Import reference model",
 ) -> list[Path]:
-    """Pick one or more STEP files. Returns an empty list if cancelled."""
+    """Pick one or more CAD/mesh reference files. Empty list if cancelled."""
     raw = filedialog.askopenfilenames(
         parent=parent,
         title=title,
         initialdir=str(initialdir) if initialdir else None,
         filetypes=[
-            ("STEP models", "*.step *.stp *.STEP *.STP"),
+            (
+                "CAD & mesh",
+                "*.step *.stp *.iges *.igs *.brep *.stl *.obj *.ply "
+                "*.STEP *.STP *.IGES *.IGS *.BREP *.STL *.OBJ *.PLY",
+            ),
+            ("STEP", "*.step *.stp *.STEP *.STP"),
+            ("STL", "*.stl *.STL"),
+            ("IGES", "*.iges *.igs *.IGES *.IGS"),
+            ("OBJ / PLY", "*.obj *.ply *.OBJ *.PLY"),
+            ("BREP", "*.brep *.BREP"),
             ("All files", "*.*"),
         ],
     )
@@ -78,7 +87,7 @@ def ask_initial_prompt(parent: tk.Tk | None = None) -> InitialBrief | None:
     ttk.Label(
         frame,
         text="e.g. a modern wooden dining chair with four slats and a slight recline. "
-        "Optionally load an existing STEP as a size / mating constraint.",
+        "Optionally load an existing STEP, STL, IGES, or OBJ as a size / mating constraint.",
         style="Hint.TLabel",
         font=f["small"],
         wraplength=scaled(root, 640),
@@ -107,7 +116,7 @@ def ask_initial_prompt(parent: tk.Tk | None = None) -> InitialBrief | None:
     ref_row = ttk.Frame(frame)
     ref_row.grid(row=4, column=0, sticky="ew", pady=(scaled(root, 10), 0))
     ref_row.columnconfigure(1, weight=1)
-    ttk.Label(ref_row, text="STEP refs", style="Hint.TLabel").grid(row=0, column=0, sticky="nw")
+    ttk.Label(ref_row, text="Refs", style="Hint.TLabel").grid(row=0, column=0, sticky="nw")
     ref_var = tk.StringVar(value="None — optional constraint models")
     ref_label = ttk.Label(
         ref_row,
@@ -138,7 +147,7 @@ def ask_initial_prompt(parent: tk.Tk | None = None) -> InitialBrief | None:
         step_paths.clear()
         refresh_ref_label()
 
-    ttk.Button(ref_row, text="Load STEP…", command=add_steps).grid(row=0, column=2, sticky="e")
+    ttk.Button(ref_row, text="Load reference…", command=add_steps).grid(row=0, column=2, sticky="e")
     ttk.Button(ref_row, text="Clear", command=clear_steps).grid(
         row=0, column=3, sticky="e", padx=(scaled(root, 6), 0)
     )

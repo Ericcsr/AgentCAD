@@ -366,7 +366,7 @@ Hard requirements:
 - Units are millimeters. Z is up. Object sits on the XY floor (z=0).
 - Prefer robust boolean unions of simple boxes/cylinders/extrusions.
 - Do not use `__import__` / `import` in that file. Injected at runtime: `cq` (cadquery),
-  `math`, and `import_reference(name)` for user-attached STEP files.
+  `math`, and `import_reference(name)` for user-attached STEP/STL/IGES/OBJ files.
 - Do not print or network inside build()/parts().
 - Do NOT modify any other project files.
 - Do NOT run CadQuery yourself; just write the source file.
@@ -397,13 +397,14 @@ Parts:
 - When a revision is scoped to ONE part, change only that part's geometry; keep other
   parts' names and interfaces stable unless the user asks otherwise.
 
-Imported STEP references:
-- The user may attach existing STEP models as constraints (mating, envelope, holes).
+Imported CAD/mesh references:
+- The user may attach STEP/STP, IGES, BREP, STL, OBJ, or ASCII PLY as constraints
+  (mating, envelope, holes).
 - Measured facts are in the prompt and in generated/references/<name>.md.
-- Do NOT open, read, cat, or glob any .step/.stp files — they are large binaries
-  and will stall this session. Facts are already extracted.
-- To use the exact B-rep in CadQuery, call import_reference("name") (returns Workplane).
-- Prefer copying measured dimensions into parametric code; import the STEP only when
+- Do NOT open, read, cat, or glob any .step/.stp/.stl/.obj/.iges/.igs/.brep/.ply
+  files — they are large binaries and will stall this session. Facts are already extracted.
+- To use the exact shape in CadQuery, call import_reference("name") (returns Workplane).
+- Prefer copying measured dimensions into parametric code; import the reference only when
   you need the exact shape (cut/union/mate/envelope).
 
 Vision / camera:
@@ -442,11 +443,11 @@ ASK_BRIEF = """You are in ASK mode for a CAD design review — read-only.
 
 Hard requirements:
 - Answer the user's question about the current design clearly and concisely.
-- Use the CadQuery source, measured geometry, and imported STEP *facts* (text) as
+- Use the CadQuery source, measured geometry, and imported reference *facts* (text) as
   ground truth. RGB renders are optional; do not wait on extra views.
 - Units are millimeters unless the user asks otherwise.
 - Do NOT modify any files. Do NOT write code. Do NOT edit the workspace.
-- Do NOT open or read any .step/.stp files.
+- Do NOT open or read any .step/.stp/.stl/.obj/.iges/.igs/.brep/.ply files.
 - Do NOT suggest you changed the model; Ask mode never changes geometry.
 - If a dimension is not explicit in the source, say so and give the best estimate from context.
 - Do not call tools unless the question is specifically about another camera angle.
@@ -538,7 +539,8 @@ or hit a context/API failure.
 Hard requirements:
 1) FIRST read generated/context_worksheet.md end-to-end.
 2) Also read generated/current_design.py, generated/feature_list.json, and
-   generated/references/*.md if they exist. Never read .step/.stp files.
+   generated/references/*.md if they exist. Never read CAD/mesh binaries
+   (.step/.stp/.stl/.obj/.iges/.igs/.brep/.ply).
 3) Treat the worksheet Task Summary / Requirements / Key Features as ground truth.
 4) Continue the Active Task — do not restart the whole product from scratch unless the
    design file is missing or empty.
@@ -1067,7 +1069,7 @@ class DesignAgent:
         return f"{block}\n" if block else ""
 
     def add_step_reference(self, path: Path) -> StepReference:
-        """Import a STEP file, extract facts, and attach it as design context."""
+        """Import a CAD/mesh file, extract facts, and attach it as design context."""
         existing = {ref.name for ref in self.references}
         # Reuse the same name if this exact source was already loaded
         for ref in self.references:
@@ -1083,7 +1085,10 @@ class DesignAgent:
             self._close_cursor_agent()
         try:
             self.update_worksheet(
-                notes=f"Imported STEP reference `{new_ref.name}` from {new_ref.source_path.name}."
+                notes=(
+                    f"Imported {new_ref.kind} reference `{new_ref.name}` "
+                    f"from {new_ref.source_path.name}."
+                )
             )
         except Exception:
             pass
@@ -1815,7 +1820,7 @@ class DesignAgent:
         req = prompt.strip()
         if self.references:
             names = ", ".join(f"`{r.name}`" for r in self.references)
-            req = f"{req}\n\nImported STEP constraints: {names}"
+            req = f"{req}\n\nImported reference constraints: {names}"
         self.last_requirements = req
         self.worksheet = ContextWorksheet(
             model=self.model,
@@ -1926,7 +1931,7 @@ class DesignAgent:
                 f"Key features that must remain satisfied (updated):\n{feature_block}\n\n"
                 f"Current source for reference:\n```python\n{self.current_code}\n```\n\n"
                 f"If RGB renders are attached, use them for proportions. Do not open "
-                f".step files. Then apply this revision and overwrite the file with the "
+                f"reference CAD/mesh binaries. Then apply this revision and overwrite the file with the "
                 f"full updated parts()/build() source:\n{instruction}",
                 images=render_paths,
             )

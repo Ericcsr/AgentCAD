@@ -291,7 +291,7 @@ class DesignStudio:
             side=tk.LEFT, padx=(scaled(self.root, 6), 0)
         )
         self.import_step_btn = ttk.Button(
-            view_row, text="Import STEP", command=self._on_import_step
+            view_row, text="Import reference", command=self._on_import_step
         )
         self.import_step_btn.pack(side=tk.LEFT, padx=(scaled(self.root, 10), 0))
 
@@ -1034,8 +1034,8 @@ class DesignStudio:
         paths = ask_open_step_paths(self.root, initialdir=self.models_dir)
         if not paths:
             return
-        self._set_busy(True, "Agent · Reading STEP…")
-        self._log_system("Importing STEP: " + ", ".join(p.name for p in paths))
+        self._set_busy(True, "Agent · Reading reference…")
+        self._log_system("Importing reference: " + ", ".join(p.name for p in paths))
 
         def work() -> None:
             imported: list = []
@@ -1051,19 +1051,20 @@ class DesignStudio:
                     return
                 self._set_busy(False, "Agent · Ready")
                 if err:
-                    self._log_error(f"STEP import failed · {err}")
-                    messagebox.showerror("Import STEP failed", err, parent=self.root)
+                    self._log_error(f"Reference import failed · {err}")
+                    messagebox.showerror("Import reference failed", err, parent=self.root)
                     return
                 self._refresh_reference_overlay(reset_camera=True)
                 for ref in imported:
+                    kind = getattr(ref, "kind", "step")
                     self._log_system(
-                        f"Loaded STEP `{ref.name}` into agent context "
+                        f"Loaded {kind} `{ref.name}` into agent context "
                         f"({ref.n_solids} solid(s), {mesh_bbox_summary(ref.vertices)})\n"
                         f"{ref.summary}"
                     )
                 self._log_system(
                     "Next Agent / Ask message will include these measured constraints. "
-                    "Ghost overlay = imported STEP (not the live design)."
+                    "Ghost overlay = imported reference (not the live design)."
                 )
 
             self.root.after(0, done)
